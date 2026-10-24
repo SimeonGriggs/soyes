@@ -9,15 +9,34 @@ struct SonosSpeaker {
             metadata: try tag(soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>"), "CurrentURIMetaData") ?? "",
             wasPlaying: (try tag(soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetTransportInfo", body: "<InstanceID>0</InstanceID>"), "CurrentTransportState")) == "PLAYING"
         )
+        return playback
+    }
+
+    func volume() throws -> Int {
         let level = try tag(
             soap(path: "/MediaRenderer/RenderingControl/Control", service: "RenderingControl", action: "GetVolume", body: "<InstanceID>0</InstanceID><Channel>Master</Channel>"),
             "CurrentVolume"
         ) ?? "0"
-        print("Volume is \(level).")
-        if Int(level) == 0 {
-            print("The speaker volume is 0, so turn it up if you hear nothing.")
-        }
-        return playback
+        return Int(level) ?? 0
+    }
+
+    func setVolume(_ level: Int) throws {
+        let clamped = min(100, max(0, level))
+        _ = try soap(
+            path: "/MediaRenderer/RenderingControl/Control",
+            service: "RenderingControl",
+            action: "SetVolume",
+            body: "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>\(clamped)</DesiredVolume>"
+        )
+    }
+
+    func stopPlayback() throws {
+        _ = try soap(
+            path: "/MediaRenderer/AVTransport/Control",
+            service: "AVTransport",
+            action: "Stop",
+            body: "<InstanceID>0</InstanceID>"
+        )
     }
 
     func play(url: String) throws {

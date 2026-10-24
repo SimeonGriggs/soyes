@@ -67,6 +67,11 @@ final class Streamer {
         pcm.append(samples)
     }
 
+    func cut() {
+        _ = pcm.take()
+        clients.discard()
+    }
+
     private func writePCM(_ handle: FileHandle) {
         while running {
             let samples = pcm.take()
@@ -213,6 +218,15 @@ final class ClientList: @unchecked Sendable {
         for client in current where !writeAll(client, data) {
             remove(client)
         }
+    }
+
+    func discard() {
+        lock.lock()
+        recent.removeAll(keepingCapacity: true)
+        let current = clients
+        clients.removeAll()
+        lock.unlock()
+        current.forEach { close($0) }
     }
 
     func closeAll() {
