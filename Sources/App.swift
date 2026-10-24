@@ -35,13 +35,30 @@ struct ContentView: View {
             .toggleStyle(.switch)
             .disabled(model.isBusy || model.selectedSpeaker == nil || model.selectedApp == nil)
 
-            Picker("App", selection: $model.appID) {
-                ForEach(model.apps) { app in
-                    Text(app.name).tag(Optional(app.id))
+            LabeledContent("App") {
+                HStack(spacing: 4) {
+                    Button {
+                        model.toggleSourcePlayback()
+                    } label: {
+                        Image(systemName: model.sourceIsPlaying ? "pause.fill" : "play.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(width: 22, height: 18)
+                    .contentShape(Rectangle())
+                    .disabled(model.selectedApp == nil || model.isBusy)
+                    .accessibilityLabel(model.sourceIsPlaying ? "Pause" : "Play")
+                    .help(model.sourceIsPlaying ? "Pause" : "Play")
+                    Picker("App", selection: $model.appID) {
+                        ForEach(model.apps) { app in
+                            Text(app.name).tag(Optional(app.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                    .disabled(model.isBusy || model.isOn)
                 }
             }
-            .pickerStyle(.menu)
-            .disabled(model.isBusy || model.isOn)
 
             Picker("Speaker", selection: $model.speakerID) {
                 ForEach(model.speakers) { speaker in
@@ -61,7 +78,13 @@ struct ContentView: View {
         }
         .formStyle(.grouped)
         .frame(minWidth: 380, minHeight: 220)
-        .onAppear { model.refresh() }
+        .onAppear {
+            model.refresh()
+            model.refreshSourcePlayback()
+        }
+        .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
+            model.refreshSourcePlayback()
+        }
         .onChange(of: model.speakerID) { model.loadVolume() }
         .alert("Soyes", isPresented: Binding(
             get: { model.errorText != nil },
@@ -87,6 +110,7 @@ final class PipeModel: ObservableObject {
     @Published var status = "Off"
     @Published var errorText: String?
     @Published var volume = 20.0
+    @Published var sourceIsPlaying = false
     private var volumeLoad = 0
     private var lastSentVolume: Int?
     private var pendingVolume: DispatchWorkItem?
@@ -117,6 +141,7 @@ final class PipeModel: ObservableObject {
                     self.speakerID = speakers.first?.id
                 }
                 self.loadVolume()
+                self.refreshSourcePlayback()
                 if let previousApp, apps.contains(where: { $0.id == previousApp }) {
                     self.appID = previousApp
                 } else {
@@ -153,6 +178,20 @@ final class PipeModel: ObservableObject {
         }
         pendingVolume = work
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05, execute: work)
+    }
+
+    func refreshSourcePlayback() {
+        sourceIsPlaying = selectedApp.map(AudioApps.outputRunning) ?? false
+    }
+
+    func toggleSourcePlayback() {
+        guard let app = selectedApp else { return }
+        let playing = sourceIsPlaying
+        sourceIsPlaying = !playing
+        SourcePlayback.setPlaying(!playing, app: app)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            self.refreshSourcePlayback()
+        }
     }
 
     func setStreaming(_ on: Bool) {

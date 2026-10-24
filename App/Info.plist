@@ -8,6 +8,10 @@
 	<string>Soyes</string>
 	<key>CFBundleExecutable</key>
 	<string>Soyes</string>
+	<key>CFBundleIconFile</key>
+	<string>soyes-icon</string>
+	<key>CFBundleIconName</key>
+	<string>soyes-icon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.simeongriggs.soyes</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -22,6 +26,8 @@
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.4</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Soyes plays and pauses the app you are streaming.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Soyes captures audio from the app you choose and sends it to your Sonos speaker.</string>
 	<key>NSHighResolutionCapable</key>
