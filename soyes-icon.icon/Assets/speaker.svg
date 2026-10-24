@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g transform="translate(160 160) scale(29.333)" fill="#000" fill-rule="evenodd">
+    <path fill-rule="evenodd" d="M3 4Q3 1 6 1H18Q21 1 21 4V20Q21 23 18 23H6Q3 23 3 20Z M5 5Q5 3 7 3H17Q19 3 19 5V19Q19 21 17 21H7Q5 21 5 19Z"/>
+    <circle cx="12" cy="6" r="1"/>
+    <path fill-rule="evenodd" d="M12 9A5 5 0 1 0 12.001 9Z M12 11A3 3 0 1 1 11.999 11Z"/>
+    <circle cx="12" cy="14" r="1"/>
+  </g>
+</svg>

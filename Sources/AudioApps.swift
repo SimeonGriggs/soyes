@@ -38,6 +38,12 @@ enum AudioApps {
         }
     }
 
+    static func outputRunning(_ app: AudioApp) -> Bool {
+        app.objectIDs.contains { objectID in
+            (integerProperty(objectID, kAudioProcessPropertyIsRunningOutput, as: UInt32.self) ?? 0) != 0
+        }
+    }
+
     static func match(_ query: String, in apps: [AudioApp]) -> [AudioApp] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let exact = apps.filter {
