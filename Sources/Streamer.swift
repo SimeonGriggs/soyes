@@ -1,103 +1,69 @@
 import Foundation
 
 final class Streamer {
-    private var ffmpeg: Process?
-    private var input: FileHandle?
+    let sampleRate: Double
     private var serverFD: Int32 = -1
     private let clients = ClientList()
-    private var running = true
-    private(set) var port: UInt16 = 0
-    private let gotAudio = DispatchSemaphore(value: 0)
-    private var announcedAudio = false
     private let pcm = PCMQueue()
-    private(set) var pcmFrames = 0
-    private(set) var mp3Bytes = 0
-    private(set) var ffmpegError = ""
+    private let lock = NSLock()
+    private var running = true
+    private var fedUntil = Date()
+    private var resampler: Resampler
+    private let chime: [Int16]
+    private var chimeCursor: Int?
+    private var greetUntil = Date.distantPast
+    private(set) var port: UInt16 = 0
+    var onListener: ((_ greeted: Bool) -> Void)?
 
-    func start(sampleRate: Double) throws {
-        let ffmpegURL = ffmpegExecutable()
-        guard FileManager.default.isExecutableFile(atPath: ffmpegURL) else {
-            throw PipeError.message("ffmpeg is not installed. Install it with Homebrew, then run this again.")
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: ffmpegURL)
-        process.arguments = [
-            "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-f", "s16le", "-ar", String(Int(sampleRate.rounded())), "-ac", "2", "-i", "pipe:0",
-            "-c:a", "libmp3lame", "-b:a", "160k", "-ar", "44100", "-ac", "2",
-            "-f", "mp3", "-write_xing", "0", "-id3v2_version", "0",
-            "pipe:1",
-        ]
-        let inputPipe = Pipe()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardInput = inputPipe
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-        try process.run()
-        ffmpeg = process
-        input = inputPipe.fileHandleForWriting
-
-        Thread.detachNewThread { [weak self] in
-            self?.readEncodedAudio(outputPipe.fileHandleForReading)
-        }
-        Thread.detachNewThread { [weak self] in
-            self?.writePCM(inputPipe.fileHandleForWriting)
-        }
-        Thread.detachNewThread { [weak self] in
-            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !text.isEmpty {
-                self?.ffmpegError = text
-                fputs("ffmpeg: \(text)\n", stderr)
-            }
-        }
-
-        serverFD = try listen()
+    static func streamRate(for outputRate: Double) -> Double {
+        outputRate == 44_100 ? 44_100 : 48_000
     }
 
-    func waitForAudio(timeout: TimeInterval) -> Bool {
-        gotAudio.wait(timeout: .now() + timeout) == .success
+    init(sampleRate: Double, sourceRate: Double, chime: [Int16]) {
+        self.sampleRate = sampleRate
+        self.chime = chime
+        resampler = Resampler(from: sourceRate, to: sampleRate)
+    }
+
+    func start() throws {
+        serverFD = try openSocket()
+        Thread.detachNewThread { [weak self] in
+            self?.send()
+        }
+        Thread.detachNewThread { [weak self] in
+            self?.fillSilence()
+        }
     }
 
     func write(_ samples: [Int16]) {
         guard !samples.isEmpty else { return }
-        pcmFrames += samples.count / 2
-        pcm.append(samples)
+        lock.lock()
+        fedUntil = Date()
+        let output = resampler.process(samples)
+        lock.unlock()
+        pcm.append(output)
     }
 
-    func cut() {
-        _ = pcm.take()
-        clients.discard()
-    }
-
-    private func writePCM(_ handle: FileHandle) {
-        while running {
-            let samples = pcm.take()
-            if samples.isEmpty {
-                Thread.sleep(forTimeInterval: 0.01)
-                continue
-            }
-            samples.withUnsafeBufferPointer { buffer in
-                guard let base = buffer.baseAddress else { return }
-                let data = Data(bytes: base, count: buffer.count * MemoryLayout<Int16>.size)
-                do {
-                    try handle.write(contentsOf: data)
-                } catch {
-                    ffmpegError = error.localizedDescription
-                    return
-                }
-            }
+    func setSourceRate(_ rate: Double) {
+        lock.lock()
+        if resampler.sourceRate != rate {
+            resampler = Resampler(from: rate, to: sampleRate)
         }
+        lock.unlock()
     }
+
+    func armGreeting() {
+        lock.lock()
+        greetUntil = Date().addingTimeInterval(10)
+        lock.unlock()
+    }
+
+    var hasListener: Bool { clients.hasListener }
 
     func stop() {
+        lock.lock()
         running = false
-        try? input?.close()
-        input = nil
-        ffmpeg?.terminate()
-        ffmpeg = nil
+        lock.unlock()
         if serverFD >= 0 {
             close(serverFD)
             serverFD = -1
@@ -105,20 +71,83 @@ final class Streamer {
         clients.closeAll()
     }
 
-    private func readEncodedAudio(_ handle: FileHandle) {
-        while running {
-            let data = handle.availableData
-            if data.isEmpty { break }
-            mp3Bytes += data.count
-            if !announcedAudio {
-                announcedAudio = true
-                gotAudio.signal()
+    private func send() {
+        while true {
+            lock.lock()
+            let live = running
+            lock.unlock()
+            guard live else { return }
+            var samples = pcm.take()
+            if samples.isEmpty {
+                Thread.sleep(forTimeInterval: 0.005)
+                continue
             }
-            clients.broadcast(data)
+            mixChime(into: &samples)
+            clients.broadcast(samples.withUnsafeBufferPointer { Data(buffer: $0) })
         }
     }
 
-    private func listen() throws -> Int32 {
+    private func mixChime(into samples: inout [Int16]) {
+        lock.lock()
+        guard let cursor = chimeCursor else {
+            lock.unlock()
+            return
+        }
+        let count = min(samples.count, chime.count - cursor)
+        for index in 0..<count {
+            let mixed = Int(samples[index]) + Int(chime[cursor + index])
+            samples[index] = Int16(max(-32_768, min(32_767, mixed)))
+        }
+        let next = cursor + count
+        if next >= chime.count {
+            chimeCursor = nil
+            greetUntil = .distantPast
+        } else {
+            chimeCursor = next
+        }
+        lock.unlock()
+    }
+
+    private func fillSilence() {
+        while true {
+            Thread.sleep(forTimeInterval: 0.01)
+            let now = Date()
+            lock.lock()
+            guard running else {
+                lock.unlock()
+                return
+            }
+            let gap = now.timeIntervalSince(fedUntil)
+            if gap > 0.05 { fedUntil = now }
+            lock.unlock()
+            if gap > 0.05 {
+                pcm.append([Int16](repeating: 0, count: Int(gap * sampleRate) * 2))
+            }
+        }
+    }
+
+    private func wavHeader() -> Data {
+        let rate = UInt32(sampleRate)
+        var header = Data()
+        func append<T: FixedWidthInteger>(_ value: T) {
+            withUnsafeBytes(of: value.littleEndian) { header.append(contentsOf: $0) }
+        }
+        header.append(contentsOf: Array("RIFF".utf8))
+        append(UInt32.max)
+        header.append(contentsOf: Array("WAVEfmt ".utf8))
+        append(UInt32(16))
+        append(UInt16(1))
+        append(UInt16(2))
+        append(rate)
+        append(rate * 4)
+        append(UInt16(4))
+        append(UInt16(16))
+        header.append(contentsOf: Array("data".utf8))
+        append(UInt32.max)
+        return header
+    }
+
+    private func openSocket() throws -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw PipeError.message("Could not open a streaming socket.") }
         var reuse: Int32 = 1
@@ -152,7 +181,7 @@ final class Streamer {
     }
 
     private func acceptLoop(_ fd: Int32) {
-        while running {
+        while true {
             var address = sockaddr_in()
             var length = socklen_t(MemoryLayout<sockaddr_in>.size)
             let client = withUnsafeMutablePointer(to: &address) {
@@ -161,8 +190,9 @@ final class Streamer {
             if client < 0 { break }
             var timeout = timeval(tv_sec: 1, tv_usec: 0)
             setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-            var noSignal: Int32 = 1
-            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+            var enabled: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &enabled, socklen_t(MemoryLayout<Int32>.size))
             Thread.detachNewThread { [weak self] in
                 self?.serve(client)
             }
@@ -176,57 +206,77 @@ final class Streamer {
             request.append(byte)
             if request.suffix(4).elementsEqual([13, 10, 13, 10]) { break }
         }
-        let header = "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nCache-Control: no-cache, no-store\r\nicy-name: Sonos Pipe\r\nicy-br: 160\r\nConnection: close\r\n\r\n"
-        guard writeAll(client, Data(header.utf8)) else {
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n"
+        guard writeAll(client, Data(header.utf8) + wavHeader()) else {
             close(client)
             return
         }
         clients.add(client)
+        lock.lock()
+        let greet = Date() < greetUntil && !chime.isEmpty
+        if greet { chimeCursor = 0 }
+        lock.unlock()
+        onListener?(greet)
+    }
+}
+
+private struct Resampler {
+    let sourceRate: Double
+    private let step: Double
+    private var position = 0.0
+    private var last: (Int16, Int16) = (0, 0)
+
+    init(from sourceRate: Double, to targetRate: Double) {
+        self.sourceRate = sourceRate
+        step = sourceRate / targetRate
     }
 
-    private func ffmpegExecutable() -> String {
-        for path in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
-            if FileManager.default.isExecutableFile(atPath: path) { return path }
+    mutating func process(_ input: [Int16]) -> [Int16] {
+        guard step != 1 else { return input }
+        let frames = input.count / 2
+        guard frames > 0 else { return [] }
+        var output = [Int16]()
+        output.reserveCapacity(Int(Double(frames) / step + 2) * 2)
+        while position < Double(frames) {
+            let index = Int(position)
+            let fraction = position - Double(index)
+            let left0 = index == 0 ? last.0 : input[(index - 1) * 2]
+            let right0 = index == 0 ? last.1 : input[(index - 1) * 2 + 1]
+            let left1 = input[index * 2]
+            let right1 = input[index * 2 + 1]
+            output.append(Int16(Double(left0) + (Double(left1) - Double(left0)) * fraction))
+            output.append(Int16(Double(right0) + (Double(right1) - Double(right0)) * fraction))
+            position += step
         }
-        return "/opt/homebrew/bin/ffmpeg"
+        position -= Double(frames)
+        last = (input[(frames - 1) * 2], input[(frames - 1) * 2 + 1])
+        return output
     }
 }
 
 final class ClientList: @unchecked Sendable {
     private let lock = NSLock()
     private var clients: [Int32] = []
-    private var recent = Data()
+
+    var hasListener: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !clients.isEmpty
+    }
 
     func add(_ client: Int32) {
         lock.lock()
-        let snapshot = recent
         clients.append(client)
         lock.unlock()
-        if !snapshot.isEmpty, !writeAll(client, snapshot) {
-            remove(client)
-        }
     }
 
     func broadcast(_ data: Data) {
         lock.lock()
-        recent.append(data)
-        if recent.count > 32_000 {
-            recent.removeFirst(recent.count - 32_000)
-        }
         let current = clients
         lock.unlock()
         for client in current where !writeAll(client, data) {
             remove(client)
         }
-    }
-
-    func discard() {
-        lock.lock()
-        recent.removeAll(keepingCapacity: true)
-        let current = clients
-        clients.removeAll()
-        lock.unlock()
-        current.forEach { close($0) }
     }
 
     func closeAll() {
