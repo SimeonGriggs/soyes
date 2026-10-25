@@ -75,10 +75,25 @@ struct SonosSpeaker {
         try? tag(soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>"), "CurrentURI")
     }
 
-    func play(url: String) throws {
-        let didl = """
-        <DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="1" parentID="-1" restricted="true"><dc:title>Soyes</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc><res protocolInfo="http-get:*:audio/wav:*">\(xmlEscape(url))</res></item></DIDL-Lite>
-        """
+    func nowPlaying() -> NowPlaying? {
+        guard let media = try? soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>") else {
+            return nil
+        }
+        var uri = tag(media, "CurrentURI") ?? ""
+        if uri.contains("&") { uri = unescape(uri) }
+        if let live = NowPlaying.fetchLive(from: uri) { return live }
+        let stored = NowPlaying.decode(tag(media, "CurrentURIMetaData") ?? "")
+        if uri.contains("/stream.wav") { return stored ?? NowPlaying() }
+        if let position = try? soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetPositionInfo", body: "<InstanceID>0</InstanceID>"),
+           let track = NowPlaying.decode(tag(position, "TrackMetaData") ?? ""),
+           !track.title.isEmpty {
+            return track
+        }
+        return stored ?? NowPlaying()
+    }
+
+    func play(url: String, info: NowPlaying) throws {
+        let didl = info.didl(stream: url)
         _ = try soap(
             path: "/MediaRenderer/AVTransport/Control",
             service: "AVTransport",
@@ -199,6 +214,147 @@ struct Playback {
     var uri: String
     var metadata: String
     var wasPlaying: Bool
+}
+
+struct NowPlaying: Equatable {
+    var appName: String
+    var computerName: String
+    var title: String
+    var artist: String
+    var album: String
+
+    init(appName: String = "", computerName: String = "", title: String = "", artist: String = "", album: String = "") {
+        self.appName = Self.clean(appName)
+        self.computerName = Self.clean(computerName)
+        self.title = Self.clean(title)
+        self.artist = Self.clean(artist)
+        self.album = Self.clean(album)
+    }
+
+    var isEmpty: Bool {
+        appName.isEmpty && computerName.isEmpty && title.isEmpty && artist.isEmpty && album.isEmpty
+    }
+
+    var sourceText: String {
+        if !appName.isEmpty && !computerName.isEmpty { return "\(appName) on \(computerName)" }
+        return appName.isEmpty ? computerName : appName
+    }
+
+    var summary: String {
+        guard !title.isEmpty else { return sourceText }
+        let headline = artist.isEmpty ? title : "\(title) — \(artist)"
+        let detail = [album, sourceText].filter { !$0.isEmpty }.joined(separator: " · ")
+        return detail.isEmpty ? headline : "\(headline)\n\(detail)"
+    }
+
+    var listing: String {
+        ["1", appName, computerName, title, artist, album].joined(separator: "\n") + "\n"
+    }
+
+    func didl(stream url: String) -> String {
+        let shownTitle: String
+        let shownCreator: String
+        if !title.isEmpty {
+            shownTitle = title
+            if artist.isEmpty {
+                shownCreator = sourceText
+            } else if sourceText.isEmpty {
+                shownCreator = artist
+            } else {
+                shownCreator = "\(artist) · \(sourceText)"
+            }
+        } else if !sourceText.isEmpty {
+            shownTitle = sourceText
+            shownCreator = ""
+        } else {
+            shownTitle = "Soyes"
+            shownCreator = ""
+        }
+        var item = "<dc:title>\(xmlEscape(shownTitle))</dc:title>"
+        if !shownCreator.isEmpty { item += "<dc:creator>\(xmlEscape(shownCreator))</dc:creator>" }
+        if !title.isEmpty && !album.isEmpty { item += "<upnp:album>\(xmlEscape(album))</upnp:album>" }
+        return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"><item id=\"1\" parentID=\"-1\" restricted=\"true\">\(item)<upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id=\"cdudn\" nameSpace=\"urn:schemas-rinconnetworks-com:metadata-1-0/\">SA_RINCON65031_</desc><res protocolInfo=\"http-get:*:audio/wav:*\">\(xmlEscape(url))</res></item></DIDL-Lite>"
+    }
+
+    static var thisComputer: String {
+        let sharing = Host.current().localizedName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !sharing.isEmpty { return sharing }
+        let host = ProcessInfo.processInfo.hostName
+        if let short = host.split(separator: ".").first, !short.isEmpty { return String(short) }
+        return host
+    }
+
+    static func parseListing(_ text: String) -> NowPlaying? {
+        var lines = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        if lines.last?.isEmpty == true { lines.removeLast() }
+        guard lines.first == "1" else { return nil }
+        while lines.count < 6 { lines.append("") }
+        let info = NowPlaying(appName: lines[1], computerName: lines[2], title: lines[3], artist: lines[4], album: lines[5])
+        return info.isEmpty ? nil : info
+    }
+
+    static func decode(_ metadata: String) -> NowPlaying? {
+        var xml = metadata.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !xml.isEmpty, xml != "NOT_IMPLEMENTED" else { return nil }
+        for _ in 0..<3 {
+            if xml.contains(":title>") || xml.contains("<title>") || xml.contains("<DIDL") { break }
+            let next = unescape(xml)
+            if next == xml { break }
+            xml = next
+        }
+        guard xml.contains("<") else { return nil }
+        let info = NowPlaying(
+            title: unescape(tag(xml, "title") ?? ""),
+            artist: unescape(tag(xml, "creator") ?? tag(xml, "artist") ?? ""),
+            album: unescape(tag(xml, "album") ?? "")
+        )
+        return info.isEmpty ? nil : info
+    }
+
+    static func fetchLive(from uri: String) -> NowPlaying? {
+        guard let components = URLComponents(string: uri),
+              let host = components.host,
+              let port = components.port,
+              components.path == "/stream.wav",
+              isLocal(host),
+              let url = URL(string: "http://\(host):\(port)/now-playing") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        var body: String?
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            if let data, let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) {
+                body = String(data: data, encoding: .utf8)
+            }
+            done.signal()
+        }.resume()
+        _ = done.wait(timeout: .now() + 1.2)
+        guard let body else { return nil }
+        return parseListing(body)
+    }
+
+    private static func clean(_ text: String) -> String {
+        let collapsed = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if collapsed == "missing value" { return "" }
+        return String(collapsed.prefix(200))
+    }
+
+    private static func isLocal(_ host: String) -> Bool {
+        if host == "localhost" { return true }
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4, parts.allSatisfy({ (0...255).contains($0) }) else { return false }
+        if parts[0] == 10 || parts[0] == 127 { return true }
+        if parts[0] == 192 && parts[1] == 168 { return true }
+        if parts[0] == 172 && (16...31).contains(parts[1]) { return true }
+        if parts[0] == 169 && parts[1] == 254 { return true }
+        return false
+    }
 }
 
 struct FoundSpeaker: Identifiable, Hashable {

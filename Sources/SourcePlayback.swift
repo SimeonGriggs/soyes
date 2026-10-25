@@ -4,7 +4,9 @@ import Darwin
 enum SourcePlayback {
     private static let queue = DispatchQueue(label: "soyes.source")
     nonisolated(unsafe) private static var stateScripts: [String: NSAppleScript] = [:]
+    nonisolated(unsafe) private static var trackScripts: [String: NSAppleScript] = [:]
     nonisolated(unsafe) private static var unsupported: Set<String> = []
+    nonisolated(unsafe) private static var unsupportedTracks: Set<String> = []
 
     static func setPlaying(_ playing: Bool, app: AudioApp) {
         queue.async {
@@ -14,6 +16,18 @@ enum SourcePlayback {
 
     static func isPlaying(_ app: AudioApp) -> Bool {
         queue.sync { scriptedState(app) } ?? AudioApps.outputRunning(app)
+    }
+
+    static func nowPlaying(_ app: AudioApp) -> NowPlaying? {
+        let track = queue.sync { scriptedTrack(app) }
+        guard let track else { return nil }
+        return NowPlaying(
+            appName: app.name,
+            computerName: NowPlaying.thisComputer,
+            title: track.0,
+            artist: track.1,
+            album: track.2
+        )
     }
 
     private static func send(_ playing: Bool, app: AudioApp) {
@@ -62,6 +76,64 @@ enum SourcePlayback {
             return nil
         }
         return result.booleanValue
+    }
+
+    private static func scriptedTrack(_ app: AudioApp) -> (String, String, String)? {
+        let key = target(app)
+        if unsupportedTracks.contains(key) { return ("", "", "") }
+        let script: NSAppleScript
+        if let cached = trackScripts[key] {
+            script = cached
+        } else {
+            let source = """
+            on clean(value)
+                if value is missing value then return ""
+                return value
+            end clean
+            if \(key) is running then
+                with timeout of 1 second
+                    tell \(key)
+                        try
+                            set t to current track
+                            set trackName to ""
+                            set trackArtist to ""
+                            set trackAlbum to ""
+                            try
+                                set trackName to my clean(name of t as string)
+                            end try
+                            try
+                                set trackArtist to my clean(artist of t as string)
+                            end try
+                            try
+                                set trackAlbum to my clean(album of t as string)
+                            end try
+                            return trackName & linefeed & trackArtist & linefeed & trackAlbum
+                        end try
+                    end tell
+                end timeout
+            end if
+            return ""
+            """
+            var error: NSDictionary?
+            guard let compiled = NSAppleScript(source: source), compiled.compileAndReturnError(&error) else {
+                unsupportedTracks.insert(key)
+                return ("", "", "")
+            }
+            trackScripts[key] = compiled
+            script = compiled
+        }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        if let error {
+            if (error["NSAppleScriptErrorNumber"] as? NSNumber)?.intValue == -1712 { return nil }
+            return ("", "", "")
+        }
+        let lines = result.stringValue?.components(separatedBy: "\n") ?? []
+        func line(_ index: Int) -> String {
+            guard lines.indices.contains(index) else { return "" }
+            return lines[index]
+        }
+        return (line(0), line(1), line(2))
     }
 
     private static func target(_ app: AudioApp) -> String {
