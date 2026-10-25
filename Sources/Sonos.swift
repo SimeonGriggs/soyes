@@ -4,12 +4,44 @@ struct SonosSpeaker {
     var host: String
 
     func prepare() throws -> Playback {
-        let playback = Playback(
-            uri: try tag(soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>"), "CurrentURI") ?? "",
-            metadata: try tag(soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>"), "CurrentURIMetaData") ?? "",
-            wasPlaying: (try tag(soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetTransportInfo", body: "<InstanceID>0</InstanceID>"), "CurrentTransportState")) == "PLAYING"
+        let media = try soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>")
+        return Playback(
+            uri: tag(media, "CurrentURI") ?? "",
+            metadata: tag(media, "CurrentURIMetaData") ?? "",
+            wasPlaying: transportState() == "PLAYING"
         )
-        return playback
+    }
+
+    func isMuted() throws -> Bool {
+        try tag(
+            soap(path: "/MediaRenderer/RenderingControl/Control", service: "RenderingControl", action: "GetMute", body: "<InstanceID>0</InstanceID><Channel>Master</Channel>"),
+            "CurrentMute"
+        ) == "1"
+    }
+
+    func setMute(_ muted: Bool) throws {
+        _ = try soap(
+            path: "/MediaRenderer/RenderingControl/Control",
+            service: "RenderingControl",
+            action: "SetMute",
+            body: "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>\(muted ? 1 : 0)</DesiredMute>"
+        )
+    }
+
+    func isLightOn() throws -> Bool {
+        try tag(
+            soap(path: "/DeviceProperties/Control", service: "DeviceProperties", action: "GetLEDState", body: ""),
+            "CurrentLEDState"
+        ) == "On"
+    }
+
+    func setLight(_ on: Bool) throws {
+        _ = try soap(
+            path: "/DeviceProperties/Control",
+            service: "DeviceProperties",
+            action: "SetLEDState",
+            body: "<DesiredLEDState>\(on ? "On" : "Off")</DesiredLEDState>"
+        )
     }
 
     func volume() throws -> Int {
@@ -39,9 +71,13 @@ struct SonosSpeaker {
         )
     }
 
+    func currentURI() -> String? {
+        try? tag(soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>"), "CurrentURI")
+    }
+
     func play(url: String) throws {
         let didl = """
-        <DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="1" parentID="-1" restricted="true"><dc:title>Sonos Pipe</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc><res protocolInfo="http-get:*:audio/mpeg:*">\(xmlEscape(url))</res></item></DIDL-Lite>
+        <DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="1" parentID="-1" restricted="true"><dc:title>Soyes</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc><res protocolInfo="http-get:*:audio/wav:*">\(xmlEscape(url))</res></item></DIDL-Lite>
         """
         _ = try soap(
             path: "/MediaRenderer/AVTransport/Control",
@@ -62,7 +98,10 @@ struct SonosSpeaker {
     }
 
     func restore(_ playback: Playback) {
-        guard !playback.uri.isEmpty else { return }
+        guard !playback.uri.isEmpty else {
+            try? stopPlayback()
+            return
+        }
         do {
             _ = try soap(
                 path: "/MediaRenderer/AVTransport/Control",

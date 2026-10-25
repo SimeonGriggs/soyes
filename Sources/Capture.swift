@@ -155,7 +155,7 @@ final class Capture {
             return Float(pointer.load(as: Int16.self)) / 32767
         }
         if bytes == 4 {
-            return Float(pointer.load(as: Int32.self)) / 2147483647
+            return Float(pointer.load(as: Int32.self)) / 2_147_483_648
         }
         return 0
     }
@@ -194,6 +194,26 @@ final class Capture {
         guard status == noErr, let value else { return nil }
         return value.takeRetainedValue() as String
     }
+}
+
+func defaultOutputSampleRate() -> Double {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var device = AudioObjectID(0)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr else {
+        return 48_000
+    }
+    address.mSelector = kAudioDevicePropertyNominalSampleRate
+    var rate = Float64(0)
+    size = UInt32(MemoryLayout<Float64>.size)
+    guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &rate) == noErr, rate > 0 else {
+        return 48_000
+    }
+    return rate
 }
 
 final class PCMQueue: @unchecked Sendable {

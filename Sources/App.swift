@@ -15,7 +15,7 @@ struct SoyesApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard PipeModel.shared.hasSession else { return .terminateNow }
+        guard PipeModel.shared.needsCleanup else { return .terminateNow }
         PipeModel.shared.stopForQuit {
             sender.reply(toApplicationShouldTerminate: true)
         }
@@ -60,13 +60,28 @@ struct ContentView: View {
                 }
             }
 
-            Picker("Speaker", selection: $model.speakerID) {
-                ForEach(model.speakers) { speaker in
-                    Text(speaker.name).tag(Optional(speaker.id))
+            LabeledContent("Speaker") {
+                HStack(spacing: 8) {
+                    if model.selectedSpeaker != nil {
+                        Text(model.linkState.title)
+                            .foregroundStyle(.secondary)
+                            .phaseAnimator(model.linkState.pulses ? [0.35, 1] : [1]) { text, opacity in
+                                text.opacity(opacity)
+                            } animation: { _ in
+                                .easeInOut(duration: 0.75)
+                            }
+                    }
+                    Picker("Speaker", selection: $model.speakerID) {
+                        ForEach(model.speakers) { speaker in
+                            Text(speaker.name).tag(Optional(speaker.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                    .disabled(model.isBusy || model.isOn)
                 }
             }
-            .pickerStyle(.menu)
-            .disabled(model.isBusy || model.isOn)
 
             Slider(value: $model.volume, in: 0...100) {
                 Text("Volume")
@@ -79,13 +94,17 @@ struct ContentView: View {
         .formStyle(.grouped)
         .frame(minWidth: 380, minHeight: 220)
         .onAppear {
+            model.connectSpeaker()
             model.refresh()
             model.refreshSourcePlayback()
         }
         .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
             model.refreshSourcePlayback()
         }
-        .onChange(of: model.speakerID) { model.loadVolume() }
+        .onChange(of: model.speakerID) {
+            model.loadVolume()
+            model.connectSpeaker()
+        }
         .alert("Soyes", isPresented: Binding(
             get: { model.errorText != nil },
             set: { if !$0 { model.errorText = nil } }
@@ -107,16 +126,27 @@ final class PipeModel: ObservableObject {
     @Published var appID: pid_t?
     @Published var isOn = false
     @Published var isBusy = false
-    @Published var status = "Off"
     @Published var errorText: String?
     @Published var volume = 20.0
     @Published var sourceIsPlaying = false
+    @Published var linkState: LinkState = .searching
     private var volumeLoad = 0
     private var lastSentVolume: Int?
     private var pendingVolume: DispatchWorkItem?
+    private var checkingSource = false
+    private var toggles = 0
 
+    private var link: SpeakerLink?
     private var session: StreamSession?
-    var hasSession: Bool { session != nil || isOn }
+    var needsCleanup: Bool { link != nil || session != nil }
+
+    init() {
+        let defaults = UserDefaults.standard
+        if let host = defaults.string(forKey: "speakerHost") {
+            speakers = [FoundSpeaker(name: defaults.string(forKey: "speakerName") ?? host, host: host)]
+            speakerID = host
+        }
+    }
 
     var selectedSpeaker: FoundSpeaker? {
         speakers.first { $0.id == speakerID }
@@ -127,12 +157,12 @@ final class PipeModel: ObservableObject {
     }
 
     func refresh() {
-        let previousSpeaker = speakerID
         let previousApp = appID
         DispatchQueue.global(qos: .userInitiated).async {
             let speakers = discoverSpeakers()
             let apps = AudioApps.list().filter { !$0.name.hasPrefix("pid ") }
             DispatchQueue.main.async {
+                let previousSpeaker = self.speakerID
                 self.speakers = speakers
                 self.apps = apps
                 if let previousSpeaker, speakers.contains(where: { $0.id == previousSpeaker }) {
@@ -151,6 +181,29 @@ final class PipeModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func connectSpeaker() {
+        guard let speaker = selectedSpeaker, link?.selected.host != speaker.host else { return }
+        let previous = link
+        let next = SpeakerLink(speaker: speaker)
+        next.onState = { [weak self, weak next] state in
+            DispatchQueue.main.async {
+                guard let self, let next, self.link === next else { return }
+                self.linkState = state
+            }
+        }
+        next.onError = { [weak self] message in
+            DispatchQueue.main.async { self?.errorText = message }
+        }
+        link = next
+        linkState = .searching
+        UserDefaults.standard.set(speaker.host, forKey: "speakerHost")
+        UserDefaults.standard.set(speaker.name, forKey: "speakerName")
+        DispatchQueue.global(qos: .userInitiated).async {
+            previous?.close()
+        }
+        next.open()
     }
 
     func loadVolume() {
@@ -181,13 +234,35 @@ final class PipeModel: ObservableObject {
     }
 
     func refreshSourcePlayback() {
-        sourceIsPlaying = selectedApp.map(AudioApps.outputRunning) ?? false
+        guard let app = selectedApp else {
+            sourceIsPlaying = false
+            return
+        }
+        guard !checkingSource else { return }
+        checkingSource = true
+        let toggle = toggles
+        DispatchQueue.global(qos: .userInitiated).async {
+            let playing = SourcePlayback.isPlaying(app)
+            DispatchQueue.main.async {
+                self.checkingSource = false
+                guard self.toggles == toggle, self.appID == app.id else { return }
+                self.sourceIsPlaying = playing
+            }
+        }
     }
 
     func toggleSourcePlayback() {
         guard let app = selectedApp else { return }
         let playing = sourceIsPlaying
         sourceIsPlaying = !playing
+        toggles += 1
+        if session != nil {
+            if playing {
+                link?.pause()
+            } else {
+                link?.cue()
+            }
+        }
         SourcePlayback.setPlaying(!playing, app: app)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             self.refreshSourcePlayback()
@@ -200,36 +275,26 @@ final class PipeModel: ObservableObject {
             stop()
             return
         }
-        guard let speaker = selectedSpeaker, let app = selectedApp else {
-            status = "Choose a speaker and an app."
+        connectSpeaker()
+        guard let link, let app = selectedApp else {
             isOn = false
             return
         }
         isOn = true
         isBusy = true
-        status = "Starting…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let session = StreamSession()
-            session.onStatus = { text in
-                DispatchQueue.main.async {
-                    guard self.isOn else { return }
-                    self.status = text
-                }
-            }
+            let session = StreamSession(link: link)
             do {
-                try session.start(app: app, speaker: speaker)
+                try session.start(app: app)
                 DispatchQueue.main.async {
                     self.session = session
                     self.isBusy = false
-                    self.status = "Listening to \(app.name)"
                 }
             } catch {
                 session.stop()
                 DispatchQueue.main.async {
-                    self.session = nil
                     self.isOn = false
                     self.isBusy = false
-                    self.status = "Off"
                     self.errorText = error.localizedDescription
                 }
             }
@@ -240,179 +305,20 @@ final class PipeModel: ObservableObject {
         let session = session
         self.session = nil
         isOn = false
-        isBusy = true
-        status = "Stopping…"
         DispatchQueue.global(qos: .userInitiated).async {
             session?.stop()
-            DispatchQueue.main.async {
-                self.isBusy = false
-                self.status = "Off"
-            }
         }
     }
 
     func stopForQuit(_ completion: @escaping () -> Void) {
         let session = session
+        let link = link
         self.session = nil
+        self.link = nil
         DispatchQueue.global(qos: .userInitiated).async {
             session?.stop()
+            link?.close()
             DispatchQueue.main.async(execute: completion)
-        }
-    }
-}
-
-final class StreamSession {
-    private var capture: Capture?
-    private var streamer: Streamer?
-    private var speaker: SonosSpeaker?
-    private var playback: Playback?
-    private var streamURL: String?
-    private var tookOver = false
-    private var stopped = false
-    private var engaging = false
-    private var speakerHolding = false
-    private var lastSound = Date()
-    private let lock = NSLock()
-    private let control = NSLock()
-    private var appName = ""
-    private var speakerName = ""
-    var onStatus: ((String) -> Void)?
-
-    func start(app: AudioApp, speaker selected: FoundSpeaker) throws {
-        appName = app.name
-        speakerName = selected.name
-        let capture = Capture()
-        let streamer = Streamer()
-        self.capture = capture
-        self.streamer = streamer
-        var speaker = SonosSpeaker(host: selected.host)
-        speaker.host = speaker.coordinator()
-        self.speaker = speaker
-        Thread.detachNewThread { [weak self] in
-            self?.watchSilence()
-        }
-
-        try capture.open(objectIDs: app.objectIDs, mute: true) { [weak self] samples in
-            self?.noteLevel(samples)
-            streamer.write(samples)
-        }
-        try streamer.start(sampleRate: capture.sampleRate)
-        try capture.begin()
-        streamURL = "http://\(localAddress(toward: speaker.host)):\(streamer.port)/stream.mp3"
-    }
-
-    func stop() {
-        lock.lock()
-        if stopped {
-            lock.unlock()
-            return
-        }
-        stopped = true
-        lock.unlock()
-        streamer?.stop()
-        capture?.stop()
-        control.lock()
-        if tookOver, let playback, let speaker {
-            speaker.restore(playback)
-        }
-        control.unlock()
-    }
-
-    private func noteLevel(_ samples: [Int16]) {
-        var peak = 0
-        var index = 0
-        while index < samples.count {
-            let value = Int(samples[index])
-            peak = max(peak, value < 0 ? -value : value)
-            index += 64
-        }
-        guard peak > 400 else { return }
-        lock.lock()
-        lastSound = Date()
-        let shouldStart = !tookOver && !engaging && !stopped
-        if shouldStart { engaging = true }
-        let shouldResume = speakerHolding && tookOver && !stopped
-        if shouldResume { speakerHolding = false }
-        lock.unlock()
-        if shouldStart {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                self?.beginPlayback()
-            }
-        } else if shouldResume {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                self?.resumePlayback()
-            }
-        }
-    }
-
-    private func beginPlayback() {
-        control.lock()
-        defer { control.unlock() }
-        guard !stopped, let speaker, let streamer, let url = streamURL else {
-            lock.lock()
-            engaging = false
-            lock.unlock()
-            return
-        }
-        do {
-            if playback == nil {
-                playback = try speaker.prepare()
-            }
-            if streamer.mp3Bytes == 0 {
-                _ = streamer.waitForAudio(timeout: 3)
-            }
-            lock.lock()
-            let cancelled = stopped
-            lock.unlock()
-            guard !cancelled else { return }
-            try speaker.play(url: url)
-            lock.lock()
-            tookOver = true
-            engaging = false
-            speakerHolding = false
-            lastSound = Date()
-            lock.unlock()
-            onStatus?("Streaming \(appName) to \(speakerName)")
-        } catch {
-            lock.lock()
-            engaging = false
-            lock.unlock()
-        }
-    }
-
-    private func resumePlayback() {
-        control.lock()
-        defer { control.unlock() }
-        guard !stopped, let speaker, let url = streamURL else { return }
-        try? speaker.play(url: url)
-        onStatus?("Streaming \(appName) to \(speakerName)")
-    }
-
-    private func watchSilence() {
-        while true {
-            Thread.sleep(forTimeInterval: 0.05)
-            lock.lock()
-            if stopped {
-                lock.unlock()
-                return
-            }
-            let quiet = tookOver && Date().timeIntervalSince(lastSound) > 0.25
-            let shouldStop = quiet && !speakerHolding
-            if shouldStop { speakerHolding = true }
-            let speaker = speaker
-            let streamer = streamer
-            lock.unlock()
-            guard shouldStop, let speaker, let streamer else { continue }
-            control.lock()
-            lock.lock()
-            let stillHolding = !stopped && speakerHolding
-            lock.unlock()
-            if stillHolding {
-                streamer.cut()
-                try? speaker.stopPlayback()
-                onStatus?("Listening to \(appName)")
-            }
-            control.unlock()
         }
     }
 }
