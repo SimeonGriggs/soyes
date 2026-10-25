@@ -69,10 +69,14 @@ final class SpeakerLink: @unchecked Sendable {
     private var listenerGreeted = false
     private var delay: TimeInterval = 0.7
     private var beaconUntil = Date.distantPast
+    private var streamInfo: NowPlaying?
+    private var published: NowPlaying?
+    private var lastInfoFetch = Date.distantPast
     private let lock = NSLock()
     private let commands = DispatchQueue(label: "soyes.speaker")
     private let beaconDone = DispatchSemaphore(value: 0)
     var onState: ((LinkState) -> Void)?
+    var onInfo: ((NowPlaying?) -> Void)?
     var onError: ((String) -> Void)?
 
     init(speaker: FoundSpeaker) {
@@ -119,6 +123,16 @@ final class SpeakerLink: @unchecked Sendable {
             }
         }
         streamer?.stop()
+    }
+
+    func setStreamInfo(_ info: NowPlaying) {
+        lock.lock()
+        streamInfo = info
+        let streamer = streamer
+        let active = held
+        lock.unlock()
+        streamer?.setNowPlaying(info)
+        if active { publish(info) }
     }
 
     func setSourceRate(_ rate: Double) {
@@ -262,7 +276,10 @@ final class SpeakerLink: @unchecked Sendable {
         streamURL = "http://\(localAddress(toward: selected.host)):\(streamer.port)/stream.wav"
         self.streamer = streamer
         let latest = sourceRate
+        let info = streamInfo ?? NowPlaying(computerName: NowPlaying.thisComputer)
+        streamInfo = info
         lock.unlock()
+        streamer.setNowPlaying(info)
         if let latest { streamer.setSourceRate(latest) }
         return streamer
     }
@@ -309,7 +326,10 @@ final class SpeakerLink: @unchecked Sendable {
         lock.unlock()
         guard !cancelledNow else { return }
         do {
-            try speaker.play(url: url)
+            lock.lock()
+            let info = streamInfo ?? NowPlaying(computerName: NowPlaying.thisComputer)
+            lock.unlock()
+            try speaker.play(url: url, info: info)
             lock.lock()
             held = true
             transport = "TRANSITIONING"
@@ -359,9 +379,12 @@ final class SpeakerLink: @unchecked Sendable {
 
             if state == "unknown" {
                 if !busy { onState?(.unreachable) }
+                publish(nil)
                 Thread.sleep(forTimeInterval: 1.5)
                 continue
             }
+
+            noteDisplay(on: speaker, visible: isHeld || state == "PLAYING" || state == "TRANSITIONING")
 
             if !isHeld {
                 if busy {
@@ -421,6 +444,35 @@ final class SpeakerLink: @unchecked Sendable {
         }
     }
 
+    private func noteDisplay(on speaker: SonosSpeaker, visible: Bool) {
+        guard visible else {
+            publish(nil)
+            return
+        }
+        lock.lock()
+        let owned = held ? streamInfo : nil
+        lock.unlock()
+        if let owned, !owned.isEmpty {
+            publish(owned)
+            return
+        }
+        let now = Date()
+        guard now.timeIntervalSince(lastInfoFetch) > 1 else { return }
+        lastInfoFetch = now
+        if let info = speaker.nowPlaying() {
+            publish(info)
+        }
+    }
+
+    private func publish(_ info: NowPlaying?) {
+        let shown = info?.isEmpty == false ? info : nil
+        lock.lock()
+        let changed = shown != published
+        if changed { published = shown }
+        lock.unlock()
+        if changed { onInfo?(shown) }
+    }
+
     private func runBeacon() {
         defer { beaconDone.signal() }
         let original = (try? player.isLightOn()) ?? true
@@ -464,8 +516,12 @@ final class StreamSession: @unchecked Sendable {
         }
         link.setSourceRate(capture.sampleRate)
         if link.isHeld {
+            link.setStreamInfo(NowPlaying(appName: app.name, computerName: NowPlaying.thisComputer))
             link.cue()
         } else {
+            if let info = SourcePlayback.nowPlaying(app) {
+                link.setStreamInfo(info)
+            }
             link.hold(greet: true)
         }
         try capture.begin()
@@ -483,12 +539,17 @@ final class StreamSession: @unchecked Sendable {
         stopped = true
         lock.unlock()
         capture.stop()
+        if let app {
+            link.setStreamInfo(NowPlaying(appName: app.name, computerName: NowPlaying.thisComputer))
+        }
         link.pause()
     }
 
     private func watchSource() {
         guard let app else { return }
         var running = SourcePlayback.isPlaying(app)
+        var lastInfo: NowPlaying?
+        var lastInfoAt = Date.distantPast
         while true {
             Thread.sleep(forTimeInterval: 0.1)
             lock.lock()
@@ -500,6 +561,18 @@ final class StreamSession: @unchecked Sendable {
                 link.pause()
             } else if !running && nowRunning {
                 link.cue()
+            }
+            let now = Date()
+            if lastInfo == nil || running != nowRunning || now.timeIntervalSince(lastInfoAt) > 2 {
+                lastInfoAt = now
+                if let info = SourcePlayback.nowPlaying(app), info != lastInfo {
+                    lock.lock()
+                    let finished = stopped
+                    lock.unlock()
+                    if finished { return }
+                    lastInfo = info
+                    link.setStreamInfo(info)
+                }
             }
             running = nowRunning
         }

@@ -12,6 +12,7 @@ final class Streamer {
     private let chime: [Int16]
     private var chimeCursor: Int?
     private var greetUntil = Date.distantPast
+    private var nowPlaying = Data()
     private(set) var port: UInt16 = 0
     var onListener: ((_ greeted: Bool) -> Void)?
 
@@ -55,6 +56,13 @@ final class Streamer {
     func armGreeting() {
         lock.lock()
         greetUntil = Date().addingTimeInterval(10)
+        lock.unlock()
+    }
+
+    func setNowPlaying(_ info: NowPlaying) {
+        let body = Data(info.listing.utf8)
+        lock.lock()
+        nowPlaying = body
         lock.unlock()
     }
 
@@ -124,6 +132,15 @@ final class Streamer {
                 pcm.append([Int16](repeating: 0, count: Int(gap * sampleRate) * 2))
             }
         }
+    }
+
+    private func requestPath(_ request: Data) -> String {
+        guard let text = String(data: request, encoding: .utf8) else { return "/" }
+        let line = text.split(separator: "\r\n", maxSplits: 1).first ?? ""
+        let parts = line.split(separator: " ")
+        guard parts.count >= 2 else { return "/" }
+        let target = String(parts[1])
+        return target.split(separator: "?").first.map(String.init) ?? target
     }
 
     private func wavHeader() -> Data {
@@ -205,6 +222,15 @@ final class Streamer {
         while request.count < 4096, read(client, &byte, 1) == 1 {
             request.append(byte)
             if request.suffix(4).elementsEqual([13, 10, 13, 10]) { break }
+        }
+        if requestPath(request) == "/now-playing" {
+            lock.lock()
+            let body = nowPlaying
+            lock.unlock()
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.count)\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n"
+            _ = writeAll(client, Data(header.utf8) + body)
+            close(client)
+            return
         }
         let header = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n"
         guard writeAll(client, Data(header.utf8) + wavHeader()) else {

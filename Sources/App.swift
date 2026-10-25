@@ -83,6 +83,14 @@ struct ContentView: View {
                 }
             }
 
+            if !model.nowPlaying.isEmpty {
+                LabeledContent("Playing") {
+                    Text(model.nowPlaying)
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             Slider(value: $model.volume, in: 0...100) {
                 Text("Volume")
             } onEditingChanged: { _ in
@@ -100,6 +108,9 @@ struct ContentView: View {
         }
         .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
             model.refreshSourcePlayback()
+        }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            model.loadVolume()
         }
         .onChange(of: model.speakerID) {
             model.loadVolume()
@@ -130,7 +141,9 @@ final class PipeModel: ObservableObject {
     @Published var volume = 20.0
     @Published var sourceIsPlaying = false
     @Published var linkState: LinkState = .searching
+    @Published var nowPlaying = ""
     private var volumeLoad = 0
+    private var checkingVolume = false
     private var lastSentVolume: Int?
     private var pendingVolume: DispatchWorkItem?
     private var checkingSource = false
@@ -193,6 +206,13 @@ final class PipeModel: ObservableObject {
                 self.linkState = state
             }
         }
+        next.onInfo = { [weak self, weak next] info in
+            DispatchQueue.main.async {
+                guard let self, let next, self.link === next else { return }
+                self.nowPlaying = info?.summary ?? ""
+            }
+        }
+        nowPlaying = ""
         next.onError = { [weak self] message in
             DispatchQueue.main.async { self?.errorText = message }
         }
@@ -207,13 +227,19 @@ final class PipeModel: ObservableObject {
     }
 
     func loadVolume() {
-        guard let host = selectedSpeaker?.host else { return }
+        guard let host = selectedSpeaker?.host, !checkingVolume else { return }
+        checkingVolume = true
         volumeLoad += 1
         let request = volumeLoad
         DispatchQueue.global(qos: .userInitiated).async {
             let level = try? SonosSpeaker(host: host).volume()
             DispatchQueue.main.async {
-                guard self.volumeLoad == request, let level else { return }
+                self.checkingVolume = false
+                guard self.speakerID == host else {
+                    self.loadVolume()
+                    return
+                }
+                guard self.volumeLoad == request, let level, level != Int(self.volume.rounded()) else { return }
                 self.lastSentVolume = level
                 self.volume = Double(level)
             }
@@ -224,6 +250,7 @@ final class PipeModel: ObservableObject {
         guard let host = selectedSpeaker?.host else { return }
         let level = Int(volume.rounded())
         guard level != lastSentVolume else { return }
+        volumeLoad += 1
         lastSentVolume = level
         pendingVolume?.cancel()
         let work = DispatchWorkItem {
