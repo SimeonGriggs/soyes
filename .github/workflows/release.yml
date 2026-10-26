@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: macos-26
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      title: ${{ steps.version.outputs.title }}
+      asset: ${{ steps.version.outputs.asset }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Stamp version
+        id: version
+        run: |
+          short=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' App/Info.plist)
+          IFS=. read -r major minor _ <<< "$short"
+          minor=${minor:-0}
+          build="${{ github.run_number }}"
+          version="${major}.${minor}.${build}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build" App/Info.plist
+          {
+            echo "tag=v${version}"
+            echo "title=Soyes ${version}"
+            echo "asset=Soyes-${version}.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Verify signature
+        run: codesign --verify --strict --verbose=2 Soyes.app
+
+      - name: Package
+        run: ditto -c -k --keepParent Soyes.app "${{ steps.version.outputs.asset }}"
+
+      - name: Upload app
+        uses: actions/upload-artifact@v7
+        with:
+          name: soyes
+          path: ${{ steps.version.outputs.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download app
+        uses: actions/download-artifact@v8
+        with:
+          name: soyes
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          TITLE: ${{ needs.build.outputs.title }}
+          ASSET: ${{ needs.build.outputs.asset }}
+        run: |
+          gh release create "$TAG" "$ASSET" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --generate-notes

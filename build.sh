@@ -17,6 +17,7 @@ rm -rf "$icon_dir"
 swiftc -swift-version 5 -O -parse-as-library \
   -framework SwiftUI \
   -framework CoreAudio \
+  -framework AudioToolbox \
   -framework AppKit \
   -framework Foundation \
   Sources/*.swift \

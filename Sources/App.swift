@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import SwiftUI
 
 @main
@@ -9,11 +10,20 @@ struct SoyesApp: App {
         WindowGroup {
             ContentView()
         }
-        .defaultSize(width: 420, height: 320)
+        .defaultSize(width: 420, height: 380)
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let volumeKeys = VolumeKeys()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        volumeKeys.install()
+        DispatchQueue.global(qos: .userInitiated).async {
+            Capture.requestAccess()
+        }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard PipeModel.shared.needsCleanup else { return .terminateNow }
         PipeModel.shared.stopForQuit {
@@ -28,12 +38,30 @@ struct ContentView: View {
 
     var body: some View {
         Form {
-            Toggle("Stream", isOn: Binding(
-                get: { model.isOn },
-                set: { model.setStreaming($0) }
-            ))
-            .toggleStyle(.switch)
-            .disabled(model.isBusy || model.selectedSpeaker == nil || model.selectedApp == nil)
+            LabeledContent("Stream") {
+                HStack(spacing: 10) {
+                    Picker("Format", selection: Binding(
+                        get: { model.streamFormat },
+                        set: { model.setStreamFormat($0) }
+                    )) {
+                        ForEach(StreamFormat.allCases) { format in
+                            Text(format.title).tag(format)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                    .disabled(model.isBusy)
+                    Toggle("Stream", isOn: Binding(
+                        get: { model.isOn },
+                        set: { model.setStreaming($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .accessibilityLabel("Stream")
+                    .disabled(model.isBusy || model.selectedSpeaker == nil || model.selectedApp == nil)
+                }
+            }
 
             LabeledContent("App") {
                 HStack(spacing: 4) {
@@ -83,14 +111,6 @@ struct ContentView: View {
                 }
             }
 
-            if !model.nowPlaying.isEmpty {
-                LabeledContent("Playing") {
-                    Text(model.nowPlaying)
-                        .multilineTextAlignment(.trailing)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
             Slider(value: $model.volume, in: 0...100) {
                 Text("Volume")
             } onEditingChanged: { _ in
@@ -98,9 +118,46 @@ struct ContentView: View {
             }
             .disabled(model.selectedSpeaker == nil || model.isBusy)
             .onChange(of: model.volume) { model.commitVolume() }
+
+            LabeledContent("Playing") {
+                VStack(alignment: .trailing, spacing: 6) {
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            if !model.trackTitle.isEmpty {
+                                Text(model.trackTitle)
+                                    .fontWeight(.bold)
+                                    .multilineTextAlignment(.trailing)
+                                    .lineLimit(2)
+                                if !trackDetail.isEmpty {
+                                    Text(trackDetail)
+                                        .multilineTextAlignment(.trailing)
+                                        .lineLimit(2)
+                                }
+                            }
+                        }
+                        if let artwork = model.artwork {
+                            Image(nsImage: artwork)
+                                .resizable()
+                                .interpolation(.high)
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: 54, height: 54)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                .accessibilityLabel("Cover")
+                        }
+                    }
+                    if !model.trackSource.isEmpty {
+                        Text(model.trackSource)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
         }
         .formStyle(.grouped)
-        .frame(minWidth: 380, minHeight: 220)
+        .frame(minWidth: 380, minHeight: 340)
         .onAppear {
             model.connectSpeaker()
             model.refresh()
@@ -121,9 +178,13 @@ struct ContentView: View {
             set: { if !$0 { model.errorText = nil } }
         )) {
             Button("OK") { model.errorText = nil }
-        } message: {
+        }         message: {
             Text(model.errorText ?? "")
         }
+    }
+
+    private var trackDetail: String {
+        [model.trackArtist, model.trackAlbum].filter { !$0.isEmpty }.joined(separator: " • ")
     }
 }
 
@@ -136,12 +197,17 @@ final class PipeModel: ObservableObject {
     @Published var speakerID: String?
     @Published var appID: pid_t?
     @Published var isOn = false
+    @Published var streamFormat: StreamFormat = .wav
     @Published var isBusy = false
     @Published var errorText: String?
     @Published var volume = 20.0
     @Published var sourceIsPlaying = false
     @Published var linkState: LinkState = .searching
-    @Published var nowPlaying = ""
+    @Published var trackTitle = ""
+    @Published var trackArtist = ""
+    @Published var trackAlbum = ""
+    @Published var trackSource = ""
+    @Published var artwork: NSImage?
     private var volumeLoad = 0
     private var checkingVolume = false
     private var lastSentVolume: Int?
@@ -155,6 +221,9 @@ final class PipeModel: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: "streamFormat"), let format = StreamFormat(rawValue: raw) {
+            streamFormat = format
+        }
         if let host = defaults.string(forKey: "speakerHost") {
             speakers = [FoundSpeaker(name: defaults.string(forKey: "speakerName") ?? host, host: host)]
             speakerID = host
@@ -167,6 +236,14 @@ final class PipeModel: ObservableObject {
 
     var selectedApp: AudioApp? {
         apps.first { $0.id == appID }
+    }
+
+    private func applyNowPlaying(_ info: NowPlaying?) {
+        trackTitle = info?.title ?? ""
+        trackArtist = info?.artist ?? ""
+        trackAlbum = info?.album ?? ""
+        trackSource = info?.windowSource ?? ""
+        artwork = info.flatMap { $0.artwork.isEmpty ? nil : NSImage(data: $0.artwork) }
     }
 
     func refresh() {
@@ -199,7 +276,7 @@ final class PipeModel: ObservableObject {
     func connectSpeaker() {
         guard let speaker = selectedSpeaker, link?.selected.host != speaker.host else { return }
         let previous = link
-        let next = SpeakerLink(speaker: speaker)
+        let next = SpeakerLink(speaker: speaker, format: streamFormat)
         next.onState = { [weak self, weak next] state in
             DispatchQueue.main.async {
                 guard let self, let next, self.link === next else { return }
@@ -209,10 +286,10 @@ final class PipeModel: ObservableObject {
         next.onInfo = { [weak self, weak next] info in
             DispatchQueue.main.async {
                 guard let self, let next, self.link === next else { return }
-                self.nowPlaying = info?.summary ?? ""
+                self.applyNowPlaying(info)
             }
         }
-        nowPlaying = ""
+        applyNowPlaying(nil)
         next.onError = { [weak self] message in
             DispatchQueue.main.async { self?.errorText = message }
         }
@@ -260,6 +337,16 @@ final class PipeModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
+    func nudgeVolume(by amount: Int) {
+        guard selectedSpeaker != nil, !isBusy else { return }
+        volume = Double(min(100, max(0, Int(volume.rounded()) + amount)))
+    }
+
+    func muteVolume() {
+        guard selectedSpeaker != nil, !isBusy else { return }
+        volume = 0
+    }
+
     func refreshSourcePlayback() {
         guard let app = selectedApp else {
             sourceIsPlaying = false
@@ -294,6 +381,13 @@ final class PipeModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             self.refreshSourcePlayback()
         }
+    }
+
+    func setStreamFormat(_ format: StreamFormat) {
+        guard format != streamFormat else { return }
+        streamFormat = format
+        UserDefaults.standard.set(format.rawValue, forKey: "streamFormat")
+        link?.setFormat(format)
     }
 
     func setStreaming(_ on: Bool) {
@@ -348,4 +442,42 @@ final class PipeModel: ObservableObject {
             DispatchQueue.main.async(execute: completion)
         }
     }
+}
+
+private final class VolumeKeys {
+    private var keys: [EventHotKeyRef] = []
+    private var handler: EventHandlerRef?
+
+    func install() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), volumeKeyPressed, 1, &eventType, nil, &handler)
+        register(kVK_F12, id: 1)
+        register(kVK_F11, id: 2)
+        register(kVK_F10, id: 3)
+    }
+
+    private func register(_ key: Int, id: UInt32) {
+        var keyRef: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: OSType(0x5379_6573), id: id)
+        let status = RegisterEventHotKey(UInt32(key), UInt32(cmdKey), hotKeyID, GetApplicationEventTarget(), 0, &keyRef)
+        if status == noErr, let keyRef {
+            keys.append(keyRef)
+        }
+    }
+}
+
+private func volumeKeyPressed(_ next: EventHandlerCallRef?, _ event: EventRef?, _ user: UnsafeMutableRawPointer?) -> OSStatus {
+    guard let event else { return noErr }
+    var hotKeyID = EventHotKeyID()
+    let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+    guard status == noErr else { return status }
+    DispatchQueue.main.async {
+        switch hotKeyID.id {
+        case 1: PipeModel.shared.nudgeVolume(by: 5)
+        case 2: PipeModel.shared.nudgeVolume(by: -5)
+        case 3: PipeModel.shared.muteVolume()
+        default: break
+        }
+    }
+    return noErr
 }

@@ -5,8 +5,10 @@ enum SourcePlayback {
     private static let queue = DispatchQueue(label: "soyes.source")
     nonisolated(unsafe) private static var stateScripts: [String: NSAppleScript] = [:]
     nonisolated(unsafe) private static var trackScripts: [String: NSAppleScript] = [:]
+    nonisolated(unsafe) private static var artworkScripts: [String: NSAppleScript] = [:]
     nonisolated(unsafe) private static var unsupported: Set<String> = []
     nonisolated(unsafe) private static var unsupportedTracks: Set<String> = []
+    nonisolated(unsafe) private static var artworkCache: (key: String, data: Data)?
 
     static func setPlaying(_ playing: Bool, app: AudioApp) {
         queue.async {
@@ -21,12 +23,14 @@ enum SourcePlayback {
     static func nowPlaying(_ app: AudioApp) -> NowPlaying? {
         let track = queue.sync { scriptedTrack(app) }
         guard let track else { return nil }
+        let artwork = queue.sync { artwork(for: app, title: track.0, artist: track.1, album: track.2) }
         return NowPlaying(
             appName: app.name,
             computerName: NowPlaying.thisComputer,
             title: track.0,
             artist: track.1,
-            album: track.2
+            album: track.2,
+            artwork: artwork
         )
     }
 
@@ -134,6 +138,68 @@ enum SourcePlayback {
             return lines[index]
         }
         return (line(0), line(1), line(2))
+    }
+
+    private static func artwork(for app: AudioApp, title: String, artist: String, album: String) -> Data {
+        guard !title.isEmpty || !artist.isEmpty else { return Data() }
+        let key = "\(target(app))\n\(title)\n\(artist)\n\(album)"
+        if let artworkCache, artworkCache.key == key { return artworkCache.data }
+        guard let data = fetchedArtwork(for: app) else { return Data() }
+        artworkCache = (key, data)
+        return data
+    }
+
+    private static func fetchedArtwork(for app: AudioApp) -> Data? {
+        if app.bundleID == "com.apple.Music" || app.name.caseInsensitiveCompare("Music") == .orderedSame {
+            return musicArtwork(app)
+        }
+        return Data()
+    }
+
+    private static func musicArtwork(_ app: AudioApp) -> Data? {
+        let key = target(app)
+        let script: NSAppleScript
+        if let cached = artworkScripts[key] {
+            script = cached
+        } else {
+            let source = """
+            if \(key) is running then
+                with timeout of 2 seconds
+                    tell \(key)
+                        try
+                            if (count of artworks of current track) is 0 then return ""
+                            return raw data of artwork 1 of current track
+                        end try
+                    end tell
+                end timeout
+            end if
+            return ""
+            """
+            var error: NSDictionary?
+            guard let compiled = NSAppleScript(source: source), compiled.compileAndReturnError(&error) else {
+                return Data()
+            }
+            artworkScripts[key] = compiled
+            script = compiled
+        }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        if let error {
+            if (error["NSAppleScriptErrorNumber"] as? NSNumber)?.intValue == -1712 { return nil }
+            return Data()
+        }
+        if let image = imageData(result.data) { return image }
+        if let coerced = result.coerce(toDescriptorType: typeData), let image = imageData(coerced.data) {
+            return image
+        }
+        return Data()
+    }
+
+    private static func imageData(_ data: Data) -> Data? {
+        guard data.count > 32, let image = NSImage(data: data), image.size.width > 1, image.size.height > 1 else {
+            return nil
+        }
+        return data
     }
 
     private static func target(_ app: AudioApp) -> String {

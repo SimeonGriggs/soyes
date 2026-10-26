@@ -55,6 +55,7 @@ final class SpeakerLink: @unchecked Sendable {
     private var speaker: SonosSpeaker?
     private var streamer: Streamer?
     private var streamURL: String?
+    private var format: StreamFormat
     private var sourceRate: Double?
     private var playback: Playback?
     private var wasMuted: Bool?
@@ -79,9 +80,42 @@ final class SpeakerLink: @unchecked Sendable {
     var onInfo: ((NowPlaying?) -> Void)?
     var onError: ((String) -> Void)?
 
-    init(speaker: FoundSpeaker) {
+    init(speaker: FoundSpeaker, format: StreamFormat) {
         selected = speaker
         player = SonosSpeaker(host: speaker.host)
+        self.format = format
+    }
+
+    func setFormat(_ format: StreamFormat) {
+        lock.lock()
+        let changed = self.format != format
+        self.format = format
+        let streamer = self.streamer
+        let shouldPlay = (held || engaging) && !closed
+        lock.unlock()
+        guard changed, let streamer else { return }
+        let url = streamAddress(port: streamer.port, format: format)
+        lock.lock()
+        streamURL = url
+        let info = streamInfo ?? NowPlaying(computerName: NowPlaying.thisComputer)
+        lock.unlock()
+        streamer.dropClients(except: format)
+        streamer.disarmGreeting()
+        guard shouldPlay else { return }
+        onState?(.buffering)
+        commands.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let speaker = self.speaker
+            let still = self.held && !self.closed && self.format == format
+            self.lock.unlock()
+            guard still, let speaker else { return }
+            do {
+                try speaker.play(url: url, info: info)
+            } catch {
+                self.onError?(error.localizedDescription)
+            }
+        }
     }
 
     var isHeld: Bool {
@@ -273,7 +307,8 @@ final class SpeakerLink: @unchecked Sendable {
         }
         try streamer.start()
         lock.lock()
-        streamURL = "http://\(localAddress(toward: selected.host)):\(streamer.port)/stream.wav"
+        let format = self.format
+        streamURL = streamAddress(port: streamer.port, format: format)
         self.streamer = streamer
         let latest = sourceRate
         let info = streamInfo ?? NowPlaying(computerName: NowPlaying.thisComputer)
@@ -307,7 +342,10 @@ final class SpeakerLink: @unchecked Sendable {
             onError?(error.localizedDescription)
             return
         }
-        guard let url = streamURL else { return }
+        lock.lock()
+        let url = streamURL
+        lock.unlock()
+        guard let url else { return }
         if greet { streamer.armGreeting() }
         var playback: Playback?
         var wasMuted: Bool?
@@ -328,8 +366,9 @@ final class SpeakerLink: @unchecked Sendable {
         do {
             lock.lock()
             let info = streamInfo ?? NowPlaying(computerName: NowPlaying.thisComputer)
+            let playURL = streamURL ?? url
             lock.unlock()
-            try speaker.play(url: url, info: info)
+            try speaker.play(url: playURL, info: info)
             lock.lock()
             held = true
             transport = "TRANSITIONING"
@@ -349,6 +388,7 @@ final class SpeakerLink: @unchecked Sendable {
         var triedAuto = false
         var wasPlaying = false
         var checks = 0
+        var misses = 0
         while true {
             lock.lock()
             if closed {
@@ -372,17 +412,22 @@ final class SpeakerLink: @unchecked Sendable {
 
             lock.lock()
             let isHeld = held
-            let ours = streamURL
             let listening = streamer?.hasListener ?? false
             if state != "unknown" { transport = state }
             lock.unlock()
 
             if state == "unknown" {
-                if !busy { onState?(.unreachable) }
-                publish(nil)
+                if !busy {
+                    misses += 1
+                    if misses >= 3 {
+                        onState?(.unreachable)
+                        publish(nil)
+                    }
+                }
                 Thread.sleep(forTimeInterval: 1.5)
                 continue
             }
+            misses = 0
 
             noteDisplay(on: speaker, visible: isHeld || state == "PLAYING" || state == "TRANSITIONING")
 
@@ -406,7 +451,7 @@ final class SpeakerLink: @unchecked Sendable {
             }
 
             checks += 1
-            if checks % 3 == 0, let ours, let current = speaker.currentURI(), current != ours {
+            if checks % 3 == 0, let current = speaker.currentURI(), !isOurStream(current) {
                 lock.lock()
                 let original = wasMuted ?? false
                 if muted != original {
@@ -442,6 +487,20 @@ final class SpeakerLink: @unchecked Sendable {
             }
             Thread.sleep(forTimeInterval: playing ? 0.5 : 0.1)
         }
+    }
+
+    private func streamAddress(port: UInt16, format: StreamFormat) -> String {
+        "http://\(localAddress(toward: selected.host)):\(port)\(format.path)"
+    }
+
+    private func isOurStream(_ uri: String) -> Bool {
+        lock.lock()
+        let ours = streamURL
+        lock.unlock()
+        guard let ours, let our = URL(string: ours) else { return false }
+        let raw = uri.removingPercentEncoding ?? uri
+        guard let their = URL(string: raw), our.host == their.host, our.port == their.port else { return false }
+        return StreamFormat.isStreamPath(their.path)
     }
 
     private func noteDisplay(on speaker: SonosSpeaker, visible: Bool) {

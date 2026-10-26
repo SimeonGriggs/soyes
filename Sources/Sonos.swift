@@ -83,7 +83,7 @@ struct SonosSpeaker {
         if uri.contains("&") { uri = unescape(uri) }
         if let live = NowPlaying.fetchLive(from: uri) { return live }
         let stored = NowPlaying.decode(tag(media, "CurrentURIMetaData") ?? "")
-        if uri.contains("/stream.wav") { return stored ?? NowPlaying() }
+        if StreamFormat.isStream(uri) { return stored ?? NowPlaying() }
         if let position = try? soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetPositionInfo", body: "<InstanceID>0</InstanceID>"),
            let track = NowPlaying.decode(tag(position, "TrackMetaData") ?? ""),
            !track.title.isEmpty {
@@ -222,13 +222,15 @@ struct NowPlaying: Equatable {
     var title: String
     var artist: String
     var album: String
+    var artwork: Data
 
-    init(appName: String = "", computerName: String = "", title: String = "", artist: String = "", album: String = "") {
+    init(appName: String = "", computerName: String = "", title: String = "", artist: String = "", album: String = "", artwork: Data = Data()) {
         self.appName = Self.clean(appName)
         self.computerName = Self.clean(computerName)
         self.title = Self.clean(title)
         self.artist = Self.clean(artist)
         self.album = Self.clean(album)
+        self.artwork = artwork
     }
 
     var isEmpty: Bool {
@@ -238,6 +240,16 @@ struct NowPlaying: Equatable {
     var sourceText: String {
         if !appName.isEmpty && !computerName.isEmpty { return "\(appName) on \(computerName)" }
         return appName.isEmpty ? computerName : appName
+    }
+
+    var windowSource: String {
+        isThisComputer ? "" : sourceText
+    }
+
+    private var isThisComputer: Bool {
+        let here = Self.clean(Self.thisComputer)
+        guard !computerName.isEmpty, !here.isEmpty else { return false }
+        return computerName.caseInsensitiveCompare(here) == .orderedSame
     }
 
     var summary: String {
@@ -273,7 +285,8 @@ struct NowPlaying: Equatable {
         var item = "<dc:title>\(xmlEscape(shownTitle))</dc:title>"
         if !shownCreator.isEmpty { item += "<dc:creator>\(xmlEscape(shownCreator))</dc:creator>" }
         if !title.isEmpty && !album.isEmpty { item += "<upnp:album>\(xmlEscape(album))</upnp:album>" }
-        return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"><item id=\"1\" parentID=\"-1\" restricted=\"true\">\(item)<upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id=\"cdudn\" nameSpace=\"urn:schemas-rinconnetworks-com:metadata-1-0/\">SA_RINCON65031_</desc><res protocolInfo=\"http-get:*:audio/wav:*\">\(xmlEscape(url))</res></item></DIDL-Lite>"
+        let mime = StreamFormat.mime(for: url)
+        return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"><item id=\"1\" parentID=\"-1\" restricted=\"true\">\(item)<upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id=\"cdudn\" nameSpace=\"urn:schemas-rinconnetworks-com:metadata-1-0/\">SA_RINCON65031_</desc><res protocolInfo=\"http-get:*:\(mime):*\">\(xmlEscape(url))</res></item></DIDL-Lite>"
     }
 
     static var thisComputer: String {
@@ -317,7 +330,7 @@ struct NowPlaying: Equatable {
         guard let components = URLComponents(string: uri),
               let host = components.host,
               let port = components.port,
-              components.path == "/stream.wav",
+              StreamFormat.isStreamPath(components.path),
               isLocal(host),
               let url = URL(string: "http://\(host):\(port)/now-playing") else { return nil }
         var request = URLRequest(url: url)

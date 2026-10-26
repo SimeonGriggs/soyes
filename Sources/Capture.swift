@@ -13,6 +13,18 @@ final class Capture {
 
     private var onSamples: (([Int16]) -> Void)?
 
+    static func requestAccess() {
+        let processes = AudioApps.list().first?.objectIDs ?? []
+        let description = CATapDescription(stereoMixdownOfProcesses: processes)
+        description.name = "Soyes"
+        description.isPrivate = true
+        description.muteBehavior = .unmuted
+        var tap: AudioObjectID = 0
+        if AudioHardwareCreateProcessTap(description, &tap) == noErr, tap != 0 {
+            AudioHardwareDestroyProcessTap(tap)
+        }
+    }
+
     func open(objectIDs: [AudioObjectID], mute: Bool, onSamples: @escaping ([Int16]) -> Void) throws {
         self.onSamples = onSamples
         let description = CATapDescription(stereoMixdownOfProcesses: objectIDs)
