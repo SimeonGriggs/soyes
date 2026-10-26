@@ -1,5 +1,4 @@
 import AppKit
-import Carbon.HIToolbox
 import SwiftUI
 
 @main
@@ -15,10 +14,7 @@ struct SoyesApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let volumeKeys = VolumeKeys()
-
     func applicationDidFinishLaunching(_ notification: Notification) {
-        volumeKeys.install()
         DispatchQueue.global(qos: .userInitiated).async {
             Capture.requestAccess()
         }
@@ -337,16 +333,6 @@ final class PipeModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
-    func nudgeVolume(by amount: Int) {
-        guard selectedSpeaker != nil, !isBusy else { return }
-        volume = Double(min(100, max(0, Int(volume.rounded()) + amount)))
-    }
-
-    func muteVolume() {
-        guard selectedSpeaker != nil, !isBusy else { return }
-        volume = 0
-    }
-
     func refreshSourcePlayback() {
         guard let app = selectedApp else {
             sourceIsPlaying = false
@@ -442,42 +428,4 @@ final class PipeModel: ObservableObject {
             DispatchQueue.main.async(execute: completion)
         }
     }
-}
-
-private final class VolumeKeys {
-    private var keys: [EventHotKeyRef] = []
-    private var handler: EventHandlerRef?
-
-    func install() {
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), volumeKeyPressed, 1, &eventType, nil, &handler)
-        register(kVK_F12, id: 1)
-        register(kVK_F11, id: 2)
-        register(kVK_F10, id: 3)
-    }
-
-    private func register(_ key: Int, id: UInt32) {
-        var keyRef: EventHotKeyRef?
-        let hotKeyID = EventHotKeyID(signature: OSType(0x5379_6573), id: id)
-        let status = RegisterEventHotKey(UInt32(key), UInt32(cmdKey), hotKeyID, GetApplicationEventTarget(), 0, &keyRef)
-        if status == noErr, let keyRef {
-            keys.append(keyRef)
-        }
-    }
-}
-
-private func volumeKeyPressed(_ next: EventHandlerCallRef?, _ event: EventRef?, _ user: UnsafeMutableRawPointer?) -> OSStatus {
-    guard let event else { return noErr }
-    var hotKeyID = EventHotKeyID()
-    let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
-    guard status == noErr else { return status }
-    DispatchQueue.main.async {
-        switch hotKeyID.id {
-        case 1: PipeModel.shared.nudgeVolume(by: 5)
-        case 2: PipeModel.shared.nudgeVolume(by: -5)
-        case 3: PipeModel.shared.muteVolume()
-        default: break
-        }
-    }
-    return noErr
 }

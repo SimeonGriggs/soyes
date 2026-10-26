@@ -4,7 +4,7 @@ Soyes sends the audio from one Mac app to a Sonos speaker on your Wi-Fi.
 
 ![Soyes](soyes.png)
 
-Choose an app and a speaker, then turn Stream on. The menu beside that switch chooses WAV for a faster start, or AAC for a steadier stream. Soyes captures that app, mutes it on the Mac, and plays it through the speaker. The speaker chimes when Stream connects it, and its status light blinks while it connects or while audio is on its way after you press play. The speaker mutes the moment the app pauses. The play and pause button beside the app name controls that app. The volume slider sets the speaker’s volume. Command-F12 raises it, Command-F11 lowers it, and Command-F10 mutes it. Playing shows the track, artist, and album when the app provides them, and the cover when that app is Music.
+Choose an app and a speaker, then turn Stream on. The menu beside that switch chooses WAV for a faster start, or AAC for a steadier stream. Soyes captures that app, mutes it on the Mac, and plays it through the speaker. The speaker chimes when Stream connects it, and its status light blinks while it connects or while audio is on its way after you press play. The speaker mutes the moment the app pauses. The play and pause button beside the app name controls that app. The volume slider sets the speaker’s volume. Playing shows the track, artist, and album when the app provides them, and the cover when that app is Music.
 
 ## Requirements
 
