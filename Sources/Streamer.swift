@@ -1,4 +1,49 @@
+import AudioToolbox
 import Foundation
+
+enum StreamFormat: String, CaseIterable, Identifiable {
+    case wav
+    case aac
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .wav: "WAV (Faster start)"
+        case .aac: "AAC (More stable)"
+        }
+    }
+
+    var path: String {
+        switch self {
+        case .wav: "/stream.wav"
+        case .aac: "/stream.aac"
+        }
+    }
+
+    var mime: String {
+        switch self {
+        case .wav: "audio/wav"
+        case .aac: "audio/aac"
+        }
+    }
+
+    static func from(path: String) -> StreamFormat {
+        path == StreamFormat.aac.path ? .aac : .wav
+    }
+
+    static func isStreamPath(_ path: String) -> Bool {
+        path == "/stream.wav" || path == "/stream.aac"
+    }
+
+    static func isStream(_ uri: String) -> Bool {
+        uri.contains("/stream.wav") || uri.contains("/stream.aac")
+    }
+
+    static func mime(for url: String) -> String {
+        url.contains("/stream.aac") ? StreamFormat.aac.mime : StreamFormat.wav.mime
+    }
+}
 
 final class Streamer {
     let sampleRate: Double
@@ -9,6 +54,8 @@ final class Streamer {
     private var running = true
     private var fedUntil = Date()
     private var resampler: Resampler
+    private let aac: AACEncoder?
+    private var aacLive = false
     private let chime: [Int16]
     private var chimeCursor: Int?
     private var greetUntil = Date.distantPast
@@ -24,6 +71,7 @@ final class Streamer {
         self.sampleRate = sampleRate
         self.chime = chime
         resampler = Resampler(from: sourceRate, to: sampleRate)
+        aac = AACEncoder(sampleRate: sampleRate)
     }
 
     func start() throws {
@@ -91,8 +139,36 @@ final class Streamer {
                 continue
             }
             mixChime(into: &samples)
-            clients.broadcast(samples.withUnsafeBufferPointer { Data(buffer: $0) })
+            let needed = clients.formats()
+            var wav = Data()
+            var encoded = Data()
+            if needed.contains(.wav) {
+                wav = samples.withUnsafeBufferPointer { Data(buffer: $0) }
+            }
+            if needed.contains(.aac), let aac {
+                if !aacLive {
+                    aac.reset()
+                    aacLive = true
+                }
+                encoded = aac.encode(samples)
+            } else if aacLive {
+                aac?.reset()
+                aacLive = false
+            }
+            if wav.isEmpty && encoded.isEmpty { continue }
+            clients.broadcast(wav: wav, aac: encoded)
         }
+    }
+
+    func dropClients(except format: StreamFormat) {
+        clients.drop(except: format)
+    }
+
+    func disarmGreeting() {
+        lock.lock()
+        greetUntil = .distantPast
+        chimeCursor = nil
+        lock.unlock()
     }
 
     private func mixChime(into samples: inout [Int16]) {
@@ -223,7 +299,8 @@ final class Streamer {
             request.append(byte)
             if request.suffix(4).elementsEqual([13, 10, 13, 10]) { break }
         }
-        if requestPath(request) == "/now-playing" {
+        let path = requestPath(request)
+        if path == "/now-playing" {
             lock.lock()
             let body = nowPlaying
             lock.unlock()
@@ -232,12 +309,20 @@ final class Streamer {
             close(client)
             return
         }
-        let header = "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n"
-        guard writeAll(client, Data(header.utf8) + wavHeader()) else {
+        let format = StreamFormat.from(path: path)
+        if format == .aac && aac == nil {
+            let header = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            _ = writeAll(client, Data(header.utf8))
             close(client)
             return
         }
-        clients.add(client)
+        var response = Data("HTTP/1.1 200 OK\r\nContent-Type: \(format.mime)\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n".utf8)
+        if format == .wav { response.append(wavHeader()) }
+        guard writeAll(client, response) else {
+            close(client)
+            return
+        }
+        clients.add(client, format: format)
         lock.lock()
         let greet = Date() < greetUntil && !chime.isEmpty
         if greet { chimeCursor = 0 }
@@ -280,9 +365,14 @@ private struct Resampler {
     }
 }
 
+private struct StreamClient {
+    let fd: Int32
+    let format: StreamFormat
+}
+
 final class ClientList: @unchecked Sendable {
     private let lock = NSLock()
-    private var clients: [Int32] = []
+    private var clients: [StreamClient] = []
 
     var hasListener: Bool {
         lock.lock()
@@ -290,19 +380,35 @@ final class ClientList: @unchecked Sendable {
         return !clients.isEmpty
     }
 
-    func add(_ client: Int32) {
+    func formats() -> Set<StreamFormat> {
         lock.lock()
-        clients.append(client)
+        defer { lock.unlock() }
+        return Set(clients.map(\.format))
+    }
+
+    func add(_ client: Int32, format: StreamFormat) {
+        lock.lock()
+        clients.append(StreamClient(fd: client, format: format))
         lock.unlock()
     }
 
-    func broadcast(_ data: Data) {
+    func broadcast(wav: Data, aac: Data) {
         lock.lock()
         let current = clients
         lock.unlock()
-        for client in current where !writeAll(client, data) {
-            remove(client)
+        for client in current {
+            let data = client.format == .wav ? wav : aac
+            if data.isEmpty || writeAll(client.fd, data) { continue }
+            remove(client.fd)
         }
+    }
+
+    func drop(except format: StreamFormat) {
+        lock.lock()
+        let removed = clients.filter { $0.format != format }
+        clients.removeAll { $0.format != format }
+        lock.unlock()
+        removed.forEach { close($0.fd) }
     }
 
     func closeAll() {
@@ -310,15 +416,158 @@ final class ClientList: @unchecked Sendable {
         let current = clients
         clients.removeAll()
         lock.unlock()
-        current.forEach { close($0) }
+        current.forEach { close($0.fd) }
     }
 
     private func remove(_ client: Int32) {
         lock.lock()
-        clients.removeAll { $0 == client }
+        let existed = clients.contains { $0.fd == client }
+        clients.removeAll { $0.fd == client }
         lock.unlock()
-        close(client)
+        if existed { close(client) }
     }
+}
+
+private final class AACEncoder {
+    private var converter: AudioConverterRef?
+    private var pending: [Int16] = []
+    private var packetStorage = [UInt8]()
+    private let sampleRate: Double
+    private let framesPerPacket = 1024
+
+    init?(sampleRate: Double) {
+        self.sampleRate = sampleRate
+        var input = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 16,
+            mReserved: 0
+        )
+        var output = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatMPEG4AAC,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: 1024,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 0,
+            mReserved: 0
+        )
+        var created: AudioConverterRef?
+        guard AudioConverterNew(&input, &output, &created) == noErr, let created else { return nil }
+        converter = created
+        var mode: UInt32 = kAudioCodecBitRateControlMode_Constant
+        AudioConverterSetProperty(created, kAudioCodecPropertyBitRateControlMode, UInt32(MemoryLayout<UInt32>.size), &mode)
+        var bitrate: UInt32 = 256_000
+        AudioConverterSetProperty(created, kAudioConverterEncodeBitRate, UInt32(MemoryLayout<UInt32>.size), &bitrate)
+        var maxPacket: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        AudioConverterGetProperty(created, kAudioConverterPropertyMaximumOutputPacketSize, &size, &maxPacket)
+        if maxPacket < 16 { maxPacket = 2048 }
+        packetStorage = [UInt8](repeating: 0, count: Int(maxPacket))
+    }
+
+    deinit {
+        if let converter { AudioConverterDispose(converter) }
+    }
+
+    func reset() {
+        pending.removeAll(keepingCapacity: true)
+        if let converter { AudioConverterReset(converter) }
+    }
+
+    func encode(_ samples: [Int16]) -> Data {
+        pending.append(contentsOf: samples)
+        var encoded = Data()
+        while pending.count >= framesPerPacket * 2 {
+            let before = pending.count
+            if let packet = pullPacket() {
+                encoded.append(packet)
+            }
+            if pending.count == before { break }
+        }
+        return encoded
+    }
+
+    private func pullPacket() -> Data? {
+        guard let converter else { return nil }
+        let feed = AACFeed(samples: pending)
+        var packetCount: UInt32 = 1
+        var description = AudioStreamPacketDescription()
+        var status: OSStatus = noErr
+        feed.samples.withUnsafeBytes { input in
+            feed.base = UnsafeMutableRawPointer(mutating: input.baseAddress)
+            packetStorage.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                var list = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(mNumberChannels: 2, mDataByteSize: UInt32(raw.count), mData: base)
+                )
+                status = AudioConverterFillComplexBuffer(
+                    converter,
+                    { _, ioNumberDataPackets, ioData, _, userData in
+                        let feed = Unmanaged<AACFeed>.fromOpaque(userData!).takeUnretainedValue()
+                        let remaining = feed.samples.count / 2 - feed.frame
+                        let frames = min(Int(ioNumberDataPackets.pointee), remaining)
+                        guard frames > 0, let base = feed.base else {
+                            ioNumberDataPackets.pointee = 0
+                            return -1
+                        }
+                        ioNumberDataPackets.pointee = UInt32(frames)
+                        let buffers = UnsafeMutableAudioBufferListPointer(ioData)
+                        buffers[0].mNumberChannels = 2
+                        buffers[0].mDataByteSize = UInt32(frames * 4)
+                        buffers[0].mData = base.advanced(by: feed.frame * 4)
+                        feed.frame += frames
+                        return noErr
+                    },
+                    Unmanaged.passUnretained(feed).toOpaque(),
+                    &packetCount,
+                    &list,
+                    &description
+                )
+            }
+        }
+        if feed.frame > 0 {
+            pending.removeFirst(feed.frame * 2)
+        }
+        guard status == noErr, packetCount > 0 else { return nil }
+        let size = Int(description.mDataByteSize)
+        guard size > 0, size <= packetStorage.count else { return nil }
+        var packet = Data(adts(length: size))
+        packet.append(contentsOf: packetStorage.prefix(size))
+        return packet
+    }
+
+    private func adts(length: Int) -> [UInt8] {
+        let rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000]
+        let index = rates.firstIndex(of: Int(sampleRate.rounded())) ?? 4
+        let full = length + 7
+        let profile = 1
+        let channels = 2
+        return [
+            0xFF,
+            0xF1,
+            UInt8((profile << 6) | (index << 2) | (channels >> 2)),
+            UInt8(((channels & 3) << 6) | ((full >> 11) & 0x03)),
+            UInt8((full >> 3) & 0xFF),
+            UInt8(((full & 7) << 5) | 0x1F),
+            0xFC,
+        ]
+    }
+}
+
+private final class AACFeed {
+    let samples: [Int16]
+    var frame = 0
+    var base: UnsafeMutableRawPointer?
+    init(samples: [Int16]) { self.samples = samples }
 }
 
 @discardableResult
