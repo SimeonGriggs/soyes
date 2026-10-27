@@ -6,10 +6,26 @@ struct SoyesApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             ContentView()
         }
         .defaultSize(width: 420, height: 520)
+
+        MenuBarExtra {
+            MenuBarView()
+        } label: {
+            MenuBarLabel()
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
+
+private struct MenuBarLabel: View {
+    @ObservedObject private var model = PipeModel.shared
+
+    var body: some View {
+        Image(systemName: model.menuIcon)
+            .accessibilityLabel(model.isOn ? "Soyes, streaming" : "Soyes")
     }
 }
 
@@ -41,6 +57,245 @@ private struct ModelPolling: ViewModifier {
             .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
                 model.loadVolume()
             }
+    }
+}
+
+// MARK: - Menu bar panel
+
+/// A Control Center–style panel: a header with the main switch, then the source,
+/// the speakers as a multi-select list, volume, and footer commands.
+struct MenuBarView: View {
+    @ObservedObject private var model = PipeModel.shared
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 10)
+
+            section("Source") {
+                HStack(spacing: 8) {
+                    Button {
+                        model.toggleSourcePlayback()
+                    } label: {
+                        Image(systemName: model.sourceIsPlaying ? "pause.fill" : "play.fill")
+                            .frame(width: 26, height: 26)
+                            .background(Circle().fill(.quaternary))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedApp == nil)
+                    .accessibilityLabel(model.sourceIsPlaying ? "Pause" : "Play")
+                    .help(model.sourceIsPlaying ? "Pause" : "Play")
+
+                    Picker("App", selection: Binding(
+                        get: { model.appID },
+                        set: { model.setApp($0) }
+                    )) {
+                        if model.apps.isEmpty {
+                            Text("No Apps Playing Audio").tag(pid_t?.none)
+                        }
+                        ForEach(model.apps) { app in
+                            Text(app.name).tag(Optional(app.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity)
+                }
+                .padding(.horizontal, 8)
+                if !model.trackTitle.isEmpty {
+                    Text(trackLine)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 8)
+                        .padding(.top, 4)
+                }
+            }
+
+            section("Speakers") {
+                if model.speakers.isEmpty {
+                    Text(model.isDiscovering ? "Looking for speakers…" : "No speakers found")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                }
+                ForEach(model.speakers) { speaker in
+                    SpeakerRow(
+                        name: speaker.name,
+                        isSelected: model.selectedIDs.contains(speaker.id)
+                    ) {
+                        model.toggleSpeaker(speaker.id)
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.fill")
+                Slider(value: $model.volume, in: 0...100) {
+                    Text("Volume")
+                } onEditingChanged: { _ in
+                    model.commitVolume()
+                }
+                .labelsHidden()
+                .onChange(of: model.volume) { model.commitVolume() }
+                Image(systemName: "speaker.wave.3.fill")
+            }
+            .foregroundStyle(.secondary)
+            .disabled(model.selectedIDs.isEmpty)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            Divider().padding(.horizontal, 14)
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Format")
+                    Spacer()
+                    Picker("Format", selection: Binding(
+                        get: { model.streamFormat },
+                        set: { model.setStreamFormat($0) }
+                    )) {
+                        ForEach(StreamFormat.allCases) { format in
+                            Text(format.title).tag(format)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+
+                Button("Open Soyes Window") {
+                    openWindow(id: "main")
+                    NSApp.activate()
+                }
+                .buttonStyle(PanelRowStyle())
+
+                Button {
+                    NSApp.terminate(nil)
+                } label: {
+                    HStack {
+                        Text("Quit Soyes")
+                        Spacer()
+                        Text("⌘Q").foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(PanelRowStyle())
+                .keyboardShortcut("q")
+            }
+            .padding(6)
+        }
+        .frame(width: 300)
+        .modifier(ModelPolling(model: model))
+        .onAppear {
+            model.refresh()
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Soyes")
+                    .font(.headline)
+                Text(model.errorText ?? model.statusText)
+                    .font(.caption)
+                    .foregroundStyle(model.errorText == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(.red))
+                    .lineLimit(2)
+                    .onTapGesture { model.errorText = nil }
+            }
+            Spacer(minLength: 8)
+            Toggle("Stream", isOn: Binding(
+                get: { model.isOn },
+                set: { model.setStreaming($0) }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .disabled(!model.canStream)
+            .accessibilityLabel("Stream")
+        }
+    }
+
+    private var trackLine: String {
+        [model.trackTitle, model.trackArtist].filter { !$0.isEmpty }.joined(separator: " — ")
+    }
+
+    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 2)
+            content()
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 6)
+    }
+}
+
+private struct SpeakerRow: View {
+    let name: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: "hifispeaker.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                    .frame(width: 26, height: 26)
+                    .background(Circle().fill(isSelected ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary)))
+                Text(name)
+                    .lineLimit(1)
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .buttonStyle(PanelRowStyle(vertical: 3))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+/// A full-width row that highlights on hover, like the rows in Control Center.
+private struct PanelRowStyle: ButtonStyle {
+    var vertical: CGFloat = 5
+
+    func makeBody(configuration: Configuration) -> some View {
+        Row(configuration: configuration, vertical: vertical)
+    }
+
+    private struct Row: View {
+        let configuration: ButtonStyleConfiguration
+        let vertical: CGFloat
+        @State private var hovering = false
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            configuration.label
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, vertical)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(.quaternary)
+                        .opacity(isEnabled && (hovering || configuration.isPressed) ? 1 : 0)
+                )
+                .contentShape(Rectangle())
+                .opacity(isEnabled ? 1 : 0.5)
+                .onHover { hovering = $0 }
+        }
     }
 }
 
@@ -248,6 +503,11 @@ final class PipeModel: ObservableObject {
             self.applySpeakers()
             self.refresh()
         }
+    }
+
+    var menuIcon: String {
+        guard isOn else { return "hifispeaker" }
+        return selectedIDs.count > 1 ? "hifispeaker.2.fill" : "hifispeaker.fill"
     }
 
     var canStream: Bool {
