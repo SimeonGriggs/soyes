@@ -153,7 +153,59 @@ enum SourcePlayback {
         if app.bundleID == "com.apple.Music" || app.name.caseInsensitiveCompare("Music") == .orderedSame {
             return musicArtwork(app)
         }
+        if app.bundleID == "com.spotify.client" {
+            return spotifyArtwork(app)
+        }
         return Data()
+    }
+
+    /// Spotify only exposes a cover URL, so the image is downloaded once per track.
+    private static func spotifyArtwork(_ app: AudioApp) -> Data? {
+        let key = target(app)
+        let script: NSAppleScript
+        if let cached = artworkScripts[key] {
+            script = cached
+        } else {
+            let source = """
+            if \(key) is running then
+                with timeout of 2 seconds
+                    tell \(key)
+                        try
+                            return artwork url of current track
+                        end try
+                    end tell
+                end timeout
+            end if
+            return ""
+            """
+            var error: NSDictionary?
+            guard let compiled = NSAppleScript(source: source), compiled.compileAndReturnError(&error) else {
+                return Data()
+            }
+            artworkScripts[key] = compiled
+            script = compiled
+        }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        if let error {
+            if (error["NSAppleScriptErrorNumber"] as? NSNumber)?.intValue == -1712 { return nil }
+            return Data()
+        }
+        guard let text = result.stringValue, let url = URL(string: text), url.scheme == "https" else { return Data() }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+        var body: Data?
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            if let data, let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) {
+                body = data
+            }
+            done.signal()
+        }.resume()
+        _ = done.wait(timeout: .now() + 3.5)
+        // nil is not cached, so a failed download is retried on the next poll.
+        guard let body else { return nil }
+        return imageData(body) ?? Data()
     }
 
     private static func musicArtwork(_ app: AudioApp) -> Data? {
