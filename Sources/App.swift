@@ -75,13 +75,47 @@ struct MenuBarView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 10)
 
-            section("Source") {
-                HStack(spacing: 8) {
+            section("Now Playing") {
+                HStack(spacing: 10) {
+                    Group {
+                        if let artwork = model.artwork {
+                            Image(nsImage: artwork)
+                                .resizable()
+                                .interpolation(.high)
+                                .aspectRatio(contentMode: .fill)
+                        } else {
+                            Image(systemName: "music.note")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(.quaternary)
+                        }
+                    }
+                    .frame(width: 48, height: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(nowPlayingTitle)
+                            .font(.body.weight(.semibold))
+                            .lineLimit(2)
+                        if !model.trackArtist.isEmpty {
+                            Text(model.trackArtist)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .help(trackLine)
+
+                    Spacer(minLength: 4)
+
                     Button {
                         model.toggleSourcePlayback()
                     } label: {
                         Image(systemName: model.sourceIsPlaying ? "pause.fill" : "play.fill")
-                            .frame(width: 26, height: 26)
+                            .font(.system(size: 13))
+                            .frame(width: 30, height: 30)
                             .background(Circle().fill(.quaternary))
                             .contentShape(Circle())
                     }
@@ -89,32 +123,25 @@ struct MenuBarView: View {
                     .disabled(model.selectedApp == nil)
                     .accessibilityLabel(model.sourceIsPlaying ? "Pause" : "Play")
                     .help(model.sourceIsPlaying ? "Pause" : "Play")
-
-                    Picker("App", selection: Binding(
-                        get: { model.appID },
-                        set: { model.setApp($0) }
-                    )) {
-                        if model.apps.isEmpty {
-                            Text("No Apps Playing Audio").tag(pid_t?.none)
-                        }
-                        ForEach(model.apps) { app in
-                            Text(app.name).tag(Optional(app.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: .infinity)
                 }
                 .padding(.horizontal, 8)
-                if !model.trackTitle.isEmpty {
-                    Text(trackLine)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .padding(.horizontal, 8)
-                        .padding(.top, 4)
+                .padding(.bottom, 6)
+
+                Picker("App", selection: Binding(
+                    get: { model.appID },
+                    set: { model.setApp($0) }
+                )) {
+                    if model.apps.isEmpty {
+                        Text("No Apps Playing Audio").tag(pid_t?.none)
+                    }
+                    ForEach(model.apps) { app in
+                        Text(app.name).tag(Optional(app.id))
+                    }
                 }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 8)
             }
 
             section("Speakers") {
@@ -223,7 +250,12 @@ struct MenuBarView: View {
     }
 
     private var trackLine: String {
-        [model.trackTitle, model.trackArtist].filter { !$0.isEmpty }.joined(separator: " — ")
+        [model.trackTitle, model.trackArtist, model.trackAlbum].filter { !$0.isEmpty }.joined(separator: " — ")
+    }
+
+    private var nowPlayingTitle: String {
+        if !model.trackTitle.isEmpty { return model.trackTitle }
+        return model.selectedApp?.name ?? "Nothing playing"
     }
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -651,7 +683,9 @@ final class PipeModel: ObservableObject {
                     // The streamed app left the list; leave the stream alone until the user changes it.
                     return
                 }
-                self.appID = apps.first { $0.bundleID == "com.apple.Music" || $0.name.caseInsensitiveCompare("Music") == .orderedSame }?.id
+                let saved = UserDefaults.standard.string(forKey: "appBundleID") ?? ""
+                self.appID = apps.first { !saved.isEmpty && $0.bundleID == saved }?.id
+                    ?? apps.first { $0.bundleID == "com.apple.Music" || $0.name.caseInsensitiveCompare("Music") == .orderedSame }?.id
                     ?? apps.first { $0.outputRunning }?.id
                     ?? apps.first?.id
                 self.refreshSourcePlayback()
@@ -758,6 +792,7 @@ final class PipeModel: ObservableObject {
     func setApp(_ id: pid_t?) {
         guard id != appID, let app = apps.first(where: { $0.id == id }) else { return }
         appID = id
+        UserDefaults.standard.set(app.bundleID, forKey: "appBundleID")
         sourceIsPlaying = false
         refreshSourcePlayback()
         guard isOn, let link else { return }
