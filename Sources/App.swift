@@ -210,6 +210,7 @@ final class PipeModel: ObservableObject {
     private var pendingVolume: DispatchWorkItem?
     private var checkingSource = false
     private var toggles = 0
+    private var isDiscovering = false
 
     private var link: SpeakerLink?
     private var session: StreamSession?
@@ -243,21 +244,16 @@ final class PipeModel: ObservableObject {
     }
 
     func refresh() {
-        let previousApp = appID
+        refreshApps()
+        refreshSpeakers()
+    }
+
+    private func refreshApps() {
         DispatchQueue.global(qos: .userInitiated).async {
-            let speakers = discoverSpeakers()
             let apps = AudioApps.list().filter { !$0.name.hasPrefix("pid ") }
             DispatchQueue.main.async {
-                let previousSpeaker = self.speakerID
-                self.speakers = speakers
+                let previousApp = self.appID
                 self.apps = apps
-                if let previousSpeaker, speakers.contains(where: { $0.id == previousSpeaker }) {
-                    self.speakerID = previousSpeaker
-                } else {
-                    self.speakerID = speakers.first?.id
-                }
-                self.loadVolume()
-                self.refreshSourcePlayback()
                 if let previousApp, apps.contains(where: { $0.id == previousApp }) {
                     self.appID = previousApp
                 } else {
@@ -265,6 +261,29 @@ final class PipeModel: ObservableObject {
                         ?? apps.first { $0.outputRunning }?.id
                         ?? apps.first?.id
                 }
+                self.refreshSourcePlayback()
+            }
+        }
+    }
+
+    private func refreshSpeakers() {
+        guard !isDiscovering else { return }
+        isDiscovering = true
+        let known = speakers.map(\.host)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let found = discoverSpeakers(known: known)
+            DispatchQueue.main.async {
+                self.isDiscovering = false
+                // A failed lookup keeps the current list instead of replacing the chosen speaker.
+                guard let found, !found.isEmpty else { return }
+                let previousSpeaker = self.speakerID
+                self.speakers = found
+                if let previousSpeaker, found.contains(where: { $0.id == previousSpeaker }) {
+                    self.speakerID = previousSpeaker
+                } else {
+                    self.speakerID = found.first?.id
+                }
+                self.loadVolume()
             }
         }
     }

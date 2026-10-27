@@ -140,6 +140,23 @@ struct SonosSpeaker {
         }
     }
 
+    func rooms() -> [FoundSpeaker]? {
+        guard let topology = try? soap(path: "/ZoneGroupTopology/Control", service: "ZoneGroupTopology", action: "GetZoneGroupState", body: ""),
+              let state = tag(topology, "ZoneGroupState") else { return nil }
+        let xml = unescape(state)
+        var found: [FoundSpeaker] = []
+        for chunk in xml.components(separatedBy: "<ZoneGroupMember ").dropFirst() {
+            let member = chunk.prefix { $0 != ">" }
+            guard attribute("Invisible", in: String(member)) != "1",
+                  let name = attribute("ZoneName", in: String(member)),
+                  let location = attribute("Location", in: String(member)),
+                  let host = URL(string: location)?.host,
+                  !found.contains(where: { $0.host == host }) else { continue }
+            found.append(FoundSpeaker(name: name, host: host))
+        }
+        return found.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     func coordinator() -> String {
         guard let description = try? get("http://\(host):1400/xml/device_description.xml") else { return host }
         let udn = (tag(description, "UDN") ?? "").replacingOccurrences(of: "uuid:", with: "")
@@ -376,42 +393,75 @@ struct FoundSpeaker: Identifiable, Hashable {
     var id: String { host }
 }
 
-func discoverSpeakers() -> [FoundSpeaker] {
-    let fallback = [FoundSpeaker(name: "Kitchen", host: "192.168.4.21")]
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
-    process.arguments = ["-B", "_sonos._tcp", "local."]
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = pipe
-    guard (try? process.run()) != nil else { return fallback }
-    Thread.sleep(forTimeInterval: 2)
-    process.terminate()
-    let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+/// Finds every visible Sonos room. Any one reachable speaker reports the whole
+/// household in a single topology call, so known hosts are tried first and
+/// Bonjour is only used to find a first speaker. Returns nil when nothing
+/// answers, so callers can keep the list they already have.
+func discoverSpeakers(known: [String]) -> [FoundSpeaker]? {
+    for host in known {
+        if let rooms = SonosSpeaker(host: host).rooms(), !rooms.isEmpty { return rooms }
+    }
+    guard let output = runDNSSD(["-B", "_sonos._tcp", "local."], seconds: 1.5) else { return nil }
     let names = output.split(separator: "\n").compactMap { line -> String? in
         guard line.contains("Add"), let range = line.range(of: "_sonos._tcp.") else { return nil }
         let name = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
         return name.isEmpty ? nil : name
     }
-    var found: [FoundSpeaker] = []
-    for name in names {
-        let lookup = Process()
-        lookup.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
-        lookup.arguments = ["-L", name, "_sonos._tcp", "local."]
-        let detail = Pipe()
-        lookup.standardOutput = detail
-        lookup.standardError = detail
-        guard (try? lookup.run()) != nil else { continue }
-        Thread.sleep(forTimeInterval: 1.5)
-        lookup.terminate()
-        let text = String(data: detail.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        guard let match = text.range(of: #"http://(\d+\.\d+\.\d+\.\d+):"#, options: .regularExpression) else { continue }
+    var seen = Set<String>()
+    for name in names.filter({ seen.insert($0).inserted }).prefix(3) {
+        guard let text = runDNSSD(["-L", name, "_sonos._tcp", "local."], seconds: 1.5),
+              let match = text.range(of: #"http://(\d+\.\d+\.\d+\.\d+):"#, options: .regularExpression) else { continue }
         let host = String(text[match].dropFirst("http://".count).dropLast())
-        let room = name.split(separator: "@").last.map(String.init) ?? name
-        if found.contains(where: { $0.host == host }) { continue }
-        found.append(FoundSpeaker(name: room, host: host))
+        if let rooms = SonosSpeaker(host: host).rooms(), !rooms.isEmpty { return rooms }
     }
-    return found.isEmpty ? fallback : found
+    return nil
+}
+
+/// Runs dns-sd for a bounded time and returns whatever it printed. Never waits
+/// for the process to exit: dns-sd can ignore termination, and readDataToEndOfFile
+/// would then block forever.
+private func runDNSSD(_ arguments: [String], seconds: TimeInterval) -> String? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    guard (try? process.run()) != nil else { return nil }
+    let collected = CollectedOutput()
+    let handle = pipe.fileHandleForReading
+    handle.readabilityHandler = { handle in
+        let chunk = handle.availableData
+        if chunk.isEmpty {
+            handle.readabilityHandler = nil
+        } else {
+            collected.append(chunk)
+        }
+    }
+    Thread.sleep(forTimeInterval: seconds)
+    if process.isRunning {
+        process.terminate()
+        kill(process.processIdentifier, SIGKILL)
+    }
+    handle.readabilityHandler = nil
+    return collected.text
+}
+
+private final class CollectedOutput: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    var text: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(data: data, encoding: .utf8)
+    }
 }
 
 func tag(_ xml: String, _ name: String) -> String? {
