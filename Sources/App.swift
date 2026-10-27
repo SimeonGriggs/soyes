@@ -9,7 +9,7 @@ struct SoyesApp: App {
         WindowGroup {
             ContentView()
         }
-        .defaultSize(width: 420, height: 380)
+        .defaultSize(width: 420, height: 520)
     }
 }
 
@@ -29,108 +29,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Polls the source app's play state and the speaker volume while a view is visible.
+private struct ModelPolling: ViewModifier {
+    @ObservedObject var model: PipeModel
+
+    func body(content: Content) -> some View {
+        content
+            .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
+                model.refreshSourcePlayback()
+            }
+            .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+                model.loadVolume()
+            }
+    }
+}
+
+// MARK: - Window
+
 struct ContentView: View {
     @ObservedObject private var model = PipeModel.shared
 
     var body: some View {
         Form {
-            LabeledContent("Stream") {
-                HStack(spacing: 10) {
-                    Picker("Format", selection: Binding(
-                        get: { model.streamFormat },
-                        set: { model.setStreamFormat($0) }
-                    )) {
-                        ForEach(StreamFormat.allCases) { format in
-                            Text(format.title).tag(format)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .fixedSize()
-                    .disabled(model.isBusy)
-                    Toggle("Stream", isOn: Binding(
-                        get: { model.isOn },
-                        set: { model.setStreaming($0) }
-                    ))
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .accessibilityLabel("Stream")
-                    .disabled(model.isBusy || model.selectedSpeaker == nil || model.selectedApp == nil)
-                }
-            }
-
-            LabeledContent("App") {
-                HStack(spacing: 4) {
-                    Button {
-                        model.toggleSourcePlayback()
-                    } label: {
-                        Image(systemName: model.sourceIsPlaying ? "pause.fill" : "play.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .frame(width: 22, height: 18)
-                    .contentShape(Rectangle())
-                    .disabled(model.selectedApp == nil || model.isBusy)
-                    .accessibilityLabel(model.sourceIsPlaying ? "Pause" : "Play")
-                    .help(model.sourceIsPlaying ? "Pause" : "Play")
-                    Picker("App", selection: $model.appID) {
-                        ForEach(model.apps) { app in
-                            Text(app.name).tag(Optional(app.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .fixedSize()
-                    .disabled(model.isBusy || model.isOn)
-                }
-            }
-
-            LabeledContent("Speaker") {
-                HStack(spacing: 8) {
-                    if model.selectedSpeaker != nil {
-                        Text(model.linkState.title)
+            Section {
+                LabeledContent("Stream") {
+                    HStack(spacing: 10) {
+                        Text(model.statusText)
                             .foregroundStyle(.secondary)
-                            .phaseAnimator(model.linkState.pulses ? [0.35, 1] : [1]) { text, opacity in
+                            .phaseAnimator(model.isOn && model.linkState.pulses ? [0.35, 1] : [1]) { text, opacity in
                                 text.opacity(opacity)
                             } animation: { _ in
                                 .easeInOut(duration: 0.75)
                             }
-                    }
-                    Picker("Speaker", selection: $model.speakerID) {
-                        ForEach(model.speakers) { speaker in
-                            Text(speaker.name).tag(Optional(speaker.id))
+                        Picker("Format", selection: Binding(
+                            get: { model.streamFormat },
+                            set: { model.setStreamFormat($0) }
+                        )) {
+                            ForEach(StreamFormat.allCases) { format in
+                                Text(format.title).tag(format)
+                            }
                         }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .fixedSize()
+                        Toggle("Stream", isOn: Binding(
+                            get: { model.isOn },
+                            set: { model.setStreaming($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .accessibilityLabel("Stream")
+                        .disabled(!model.canStream)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .fixedSize()
-                    .disabled(model.isBusy || model.isOn)
+                }
+
+                LabeledContent("App") {
+                    HStack(spacing: 4) {
+                        Button {
+                            model.toggleSourcePlayback()
+                        } label: {
+                            Image(systemName: model.sourceIsPlaying ? "pause.fill" : "play.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .frame(width: 22, height: 18)
+                        .contentShape(Rectangle())
+                        .disabled(model.selectedApp == nil)
+                        .accessibilityLabel(model.sourceIsPlaying ? "Pause" : "Play")
+                        .help(model.sourceIsPlaying ? "Pause" : "Play")
+                        Picker("App", selection: Binding(
+                            get: { model.appID },
+                            set: { model.setApp($0) }
+                        )) {
+                            if model.apps.isEmpty {
+                                Text("No Apps Playing Audio").tag(pid_t?.none)
+                            }
+                            ForEach(model.apps) { app in
+                                Text(app.name).tag(Optional(app.id))
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .fixedSize()
+                    }
+                }
+
+                Slider(value: $model.volume, in: 0...100) {
+                    Text("Volume")
+                } onEditingChanged: { _ in
+                    model.commitVolume()
+                }
+                .disabled(model.selectedIDs.isEmpty)
+                .onChange(of: model.volume) { model.commitVolume() }
+            }
+
+            Section("Speakers") {
+                if model.speakers.isEmpty {
+                    Text(model.isDiscovering ? "Looking for speakers…" : "No speakers found")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(model.speakers) { speaker in
+                    Toggle(speaker.name, isOn: Binding(
+                        get: { model.selectedIDs.contains(speaker.id) },
+                        set: { _ in model.toggleSpeaker(speaker.id) }
+                    ))
+                    .toggleStyle(.checkbox)
                 }
             }
 
-            Slider(value: $model.volume, in: 0...100) {
-                Text("Volume")
-            } onEditingChanged: { _ in
-                model.commitVolume()
-            }
-            .disabled(model.selectedSpeaker == nil || model.isBusy)
-            .onChange(of: model.volume) { model.commitVolume() }
-
-            LabeledContent("Playing") {
-                VStack(alignment: .trailing, spacing: 6) {
-                    HStack(alignment: .center, spacing: 8) {
-                        VStack(alignment: .trailing, spacing: 2) {
-                            if !model.trackTitle.isEmpty {
-                                Text(model.trackTitle)
-                                    .fontWeight(.bold)
-                                    .multilineTextAlignment(.trailing)
-                                    .lineLimit(2)
-                                if !trackDetail.isEmpty {
-                                    Text(trackDetail)
-                                        .multilineTextAlignment(.trailing)
-                                        .lineLimit(2)
-                                }
-                            }
-                        }
+            if !model.trackTitle.isEmpty || model.artwork != nil {
+                Section("Playing") {
+                    HStack(alignment: .center, spacing: 10) {
                         if let artwork = model.artwork {
                             Image(nsImage: artwork)
                                 .resizable()
@@ -140,41 +148,37 @@ struct ContentView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                                 .accessibilityLabel("Cover")
                         }
-                    }
-                    if !model.trackSource.isEmpty {
-                        Text(model.trackSource)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.trailing)
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .trailing)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.trackTitle)
+                                .fontWeight(.bold)
+                                .lineLimit(2)
+                            if !trackDetail.isEmpty {
+                                Text(trackDetail)
+                                    .lineLimit(2)
+                            }
+                            if !model.trackSource.isEmpty {
+                                Text(model.trackSource)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
         .formStyle(.grouped)
         .frame(minWidth: 380, minHeight: 340)
+        .modifier(ModelPolling(model: model))
         .onAppear {
-            model.connectSpeaker()
             model.refresh()
             model.refreshSourcePlayback()
-        }
-        .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
-            model.refreshSourcePlayback()
-        }
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
-            model.loadVolume()
-        }
-        .onChange(of: model.speakerID) {
-            model.loadVolume()
-            model.connectSpeaker()
         }
         .alert("Soyes", isPresented: Binding(
             get: { model.errorText != nil },
             set: { if !$0 { model.errorText = nil } }
         )) {
             Button("OK") { model.errorText = nil }
-        }         message: {
+        } message: {
             Text(model.errorText ?? "")
         }
     }
@@ -184,17 +188,20 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Model
+
 @MainActor
 final class PipeModel: ObservableObject {
     static let shared = PipeModel()
 
     @Published var speakers: [FoundSpeaker] = []
     @Published var apps: [AudioApp] = []
-    @Published var speakerID: String?
+    @Published var selectedIDs: Set<String> = []
     @Published var appID: pid_t?
     @Published var isOn = false
     @Published var streamFormat: StreamFormat = .wav
     @Published var isBusy = false
+    @Published var isDiscovering = false
     @Published var errorText: String?
     @Published var volume = 20.0
     @Published var sourceIsPlaying = false
@@ -210,8 +217,13 @@ final class PipeModel: ObservableObject {
     private var pendingVolume: DispatchWorkItem?
     private var checkingSource = false
     private var toggles = 0
-    private var isDiscovering = false
+    private var busyCount = 0
+    /// Bumped by every capture start and by stop; only the newest start may become the session.
+    private var startGeneration = 0
 
+    /// Every change to the link or the capture session runs here, in order,
+    /// so a slow speaker never races a later click.
+    private let work = DispatchQueue(label: "soyes.model", qos: .userInitiated)
     private var link: SpeakerLink?
     private var session: StreamSession?
     var needsCleanup: Bool { link != nil || session != nil }
@@ -221,18 +233,136 @@ final class PipeModel: ObservableObject {
         if let raw = defaults.string(forKey: "streamFormat"), let format = StreamFormat(rawValue: raw) {
             streamFormat = format
         }
-        if let host = defaults.string(forKey: "speakerHost") {
-            speakers = [FoundSpeaker(name: defaults.string(forKey: "speakerName") ?? host, host: host)]
-            speakerID = host
+        let names = defaults.dictionary(forKey: "speakerNames") as? [String: String] ?? [:]
+        var hosts = defaults.stringArray(forKey: "speakerHosts")
+        if hosts == nil, let host = defaults.string(forKey: "speakerHost") {
+            hosts = [host] + (defaults.stringArray(forKey: "groupHosts") ?? [])
+        }
+        let saved = hosts ?? []
+        let legacyName = defaults.string(forKey: "speakerName")
+        speakers = saved.map { host in
+            FoundSpeaker(name: names[host] ?? (host == saved.first ? legacyName : nil) ?? host, host: host)
+        }
+        selectedIDs = Set(saved)
+        Task { @MainActor in
+            self.applySpeakers()
+            self.refresh()
         }
     }
 
-    var selectedSpeaker: FoundSpeaker? {
-        speakers.first { $0.id == speakerID }
+    var canStream: Bool {
+        isOn || (!isBusy && !selectedIDs.isEmpty && selectedApp != nil)
+    }
+
+    var statusText: String {
+        if selectedIDs.isEmpty { return "Choose a speaker" }
+        if selectedApp == nil { return apps.isEmpty ? "No apps playing audio" : "Choose an app" }
+        guard isOn else { return "Off" }
+        return linkState.title
     }
 
     var selectedApp: AudioApp? {
         apps.first { $0.id == appID }
+    }
+
+    /// The speaker that receives the stream; the other selected speakers join its group.
+    /// It stays the same while it is selected, so adding or removing others never
+    /// interrupts playback.
+    private var coordinator: FoundSpeaker? {
+        if let current = link?.selected, selectedIDs.contains(current.id) { return current }
+        return speakers.first { selectedIDs.contains($0.id) }
+    }
+
+    private var selectedSpeakers: [FoundSpeaker] {
+        guard let lead = coordinator else { return [] }
+        return [lead] + speakers.filter { selectedIDs.contains($0.id) && $0.id != lead.id }
+    }
+
+    func toggleSpeaker(_ id: String) {
+        if selectedIDs.contains(id) {
+            selectedIDs.remove(id)
+        } else {
+            selectedIDs.insert(id)
+        }
+        applySpeakers()
+        loadVolume()
+    }
+
+    private func persistSpeakers() {
+        let defaults = UserDefaults.standard
+        let chosen = selectedSpeakers
+        defaults.set(chosen.map(\.host), forKey: "speakerHosts")
+        var names = defaults.dictionary(forKey: "speakerNames") as? [String: String] ?? [:]
+        for speaker in chosen { names[speaker.host] = speaker.name }
+        defaults.set(names, forKey: "speakerNames")
+    }
+
+    /// Brings the link in line with the selection. Keeps the current link when its
+    /// speaker is still selected and only regroups the others; otherwise moves the
+    /// stream to a new lead speaker, restarting capture if it was on.
+    private func applySpeakers() {
+        persistSpeakers()
+        let chosen = selectedSpeakers
+        guard let lead = chosen.first else {
+            let oldSession = session
+            let oldLink = link
+            session = nil
+            link = nil
+            isOn = false
+            startGeneration += 1
+            linkState = .searching
+            applyNowPlaying(nil)
+            work.async {
+                oldSession?.stop()
+                oldLink?.close()
+            }
+            return
+        }
+        // Other speakers only join while streaming, so an idle Soyes never holds them.
+        let members = isOn ? Array(chosen.dropFirst()) : []
+        if let link, link.selected.id == lead.id {
+            link.setMembers(members)
+            return
+        }
+        let oldSession = session
+        let oldLink = link
+        let next = makeLink(lead, members: members)
+        link = next
+        session = nil
+        let app = isOn ? selectedApp : nil
+        let generation = app == nil ? 0 : nextStart()
+        work.async {
+            oldSession?.stop()
+            oldLink?.close()
+            next.open()
+            guard let app else { return }
+            let result = Self.startSession(link: next, app: app)
+            DispatchQueue.main.async {
+                self.adopt(result, link: next, generation: generation)
+            }
+        }
+    }
+
+    private func makeLink(_ speaker: FoundSpeaker, members: [FoundSpeaker]) -> SpeakerLink {
+        let next = SpeakerLink(speaker: speaker, format: streamFormat, group: members)
+        next.onState = { [weak self, weak next] state in
+            DispatchQueue.main.async {
+                guard let self, let next, self.link === next else { return }
+                self.linkState = state
+            }
+        }
+        next.onInfo = { [weak self, weak next] info in
+            DispatchQueue.main.async {
+                guard let self, let next, self.link === next else { return }
+                self.applyNowPlaying(info)
+            }
+        }
+        next.onError = { [weak self] message in
+            DispatchQueue.main.async { self?.errorText = message }
+        }
+        applyNowPlaying(nil)
+        linkState = .searching
+        return next
     }
 
     private func applyNowPlaying(_ info: NowPlaying?) {
@@ -255,12 +385,15 @@ final class PipeModel: ObservableObject {
                 let previousApp = self.appID
                 self.apps = apps
                 if let previousApp, apps.contains(where: { $0.id == previousApp }) {
-                    self.appID = previousApp
-                } else {
-                    self.appID = apps.first { $0.bundleID == "com.apple.Music" || $0.name.caseInsensitiveCompare("Music") == .orderedSame }?.id
-                        ?? apps.first { $0.outputRunning }?.id
-                        ?? apps.first?.id
+                    return
                 }
+                if self.isOn, previousApp != nil {
+                    // The streamed app left the list; leave the stream alone until the user changes it.
+                    return
+                }
+                self.appID = apps.first { $0.bundleID == "com.apple.Music" || $0.name.caseInsensitiveCompare("Music") == .orderedSame }?.id
+                    ?? apps.first { $0.outputRunning }?.id
+                    ?? apps.first?.id
                 self.refreshSourcePlayback()
             }
         }
@@ -269,57 +402,26 @@ final class PipeModel: ObservableObject {
     private func refreshSpeakers() {
         guard !isDiscovering else { return }
         isDiscovering = true
-        let known = speakers.map(\.host)
+        let known = selectedSpeakers.map(\.host) + speakers.map(\.host)
         DispatchQueue.global(qos: .userInitiated).async {
             let found = discoverSpeakers(known: known)
             DispatchQueue.main.async {
                 self.isDiscovering = false
-                // A failed lookup keeps the current list instead of replacing the chosen speaker.
+                // A failed lookup keeps the current list instead of wiping the selection.
                 guard let found, !found.isEmpty else { return }
-                let previousSpeaker = self.speakerID
+                let before = self.selectedIDs
                 self.speakers = found
-                if let previousSpeaker, found.contains(where: { $0.id == previousSpeaker }) {
-                    self.speakerID = previousSpeaker
-                } else {
-                    self.speakerID = found.first?.id
-                }
+                var kept = before.filter { id in found.contains { $0.id == id } }
+                if before.isEmpty, let first = found.first { kept = [first.id] }
+                self.selectedIDs = kept
+                self.applySpeakers()
                 self.loadVolume()
             }
         }
     }
 
-    func connectSpeaker() {
-        guard let speaker = selectedSpeaker, link?.selected.host != speaker.host else { return }
-        let previous = link
-        let next = SpeakerLink(speaker: speaker, format: streamFormat)
-        next.onState = { [weak self, weak next] state in
-            DispatchQueue.main.async {
-                guard let self, let next, self.link === next else { return }
-                self.linkState = state
-            }
-        }
-        next.onInfo = { [weak self, weak next] info in
-            DispatchQueue.main.async {
-                guard let self, let next, self.link === next else { return }
-                self.applyNowPlaying(info)
-            }
-        }
-        applyNowPlaying(nil)
-        next.onError = { [weak self] message in
-            DispatchQueue.main.async { self?.errorText = message }
-        }
-        link = next
-        linkState = .searching
-        UserDefaults.standard.set(speaker.host, forKey: "speakerHost")
-        UserDefaults.standard.set(speaker.name, forKey: "speakerName")
-        DispatchQueue.global(qos: .userInitiated).async {
-            previous?.close()
-        }
-        next.open()
-    }
-
     func loadVolume() {
-        guard let host = selectedSpeaker?.host, !checkingVolume else { return }
+        guard let host = coordinator?.host, !checkingVolume else { return }
         checkingVolume = true
         volumeLoad += 1
         let request = volumeLoad
@@ -327,7 +429,7 @@ final class PipeModel: ObservableObject {
             let level = try? SonosSpeaker(host: host).volume()
             DispatchQueue.main.async {
                 self.checkingVolume = false
-                guard self.speakerID == host else {
+                guard self.coordinator?.host == host else {
                     self.loadVolume()
                     return
                 }
@@ -339,14 +441,17 @@ final class PipeModel: ObservableObject {
     }
 
     func commitVolume() {
-        guard let host = selectedSpeaker?.host else { return }
+        let hosts = selectedSpeakers.map(\.host)
+        guard !hosts.isEmpty else { return }
         let level = Int(volume.rounded())
         guard level != lastSentVolume else { return }
         volumeLoad += 1
         lastSentVolume = level
         pendingVolume?.cancel()
         let work = DispatchWorkItem {
-            try? SonosSpeaker(host: host).setVolume(level)
+            for host in hosts {
+                try? SonosSpeaker(host: host).setVolume(level)
+            }
         }
         pendingVolume = work
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.05, execute: work)
@@ -388,6 +493,71 @@ final class PipeModel: ObservableObject {
         }
     }
 
+    /// Switches the captured app. While streaming, the capture moves to the new
+    /// app and the speakers keep playing.
+    func setApp(_ id: pid_t?) {
+        guard id != appID, let app = apps.first(where: { $0.id == id }) else { return }
+        appID = id
+        sourceIsPlaying = false
+        refreshSourcePlayback()
+        guard isOn, let link else { return }
+        let old = session
+        session = nil
+        let generation = nextStart()
+        work.async {
+            old?.stop()
+            let result = Self.startSession(link: link, app: app)
+            DispatchQueue.main.async {
+                self.adopt(result, link: link, generation: generation)
+            }
+        }
+    }
+
+    nonisolated private static func startSession(link: SpeakerLink, app: AudioApp) -> Result<StreamSession, Error> {
+        let session = StreamSession(link: link)
+        do {
+            try session.start(app: app)
+            return .success(session)
+        } catch {
+            session.stop()
+            return .failure(error)
+        }
+    }
+
+    /// Keeps a session that finished starting only if it is the newest start and
+    /// still matches what the user wants; they may have stopped, switched apps, or
+    /// changed speakers meanwhile.
+    private func adopt(_ result: Result<StreamSession, Error>, link: SpeakerLink, generation: Int) {
+        defer { endBusy() }
+        let current = generation == startGeneration && isOn && self.link === link
+        switch result {
+        case .success(let started):
+            if current {
+                let replaced = session
+                session = started
+                if let replaced { work.async { replaced.stop() } }
+            } else {
+                work.async { started.stop() }
+            }
+        case .failure(let error):
+            guard current else { return }
+            isOn = false
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func nextStart() -> Int {
+        startGeneration += 1
+        busyCount += 1
+        isBusy = true
+        return startGeneration
+    }
+
+    private func endBusy() {
+        busyCount = max(0, busyCount - 1)
+        isBusy = busyCount > 0
+    }
+
     func setStreamFormat(_ format: StreamFormat) {
         guard format != streamFormat else { return }
         streamFormat = format
@@ -396,33 +566,20 @@ final class PipeModel: ObservableObject {
     }
 
     func setStreaming(_ on: Bool) {
-        guard !isBusy else { return }
         if !on {
             stop()
             return
         }
-        connectSpeaker()
-        guard let link, let app = selectedApp else {
-            isOn = false
-            return
-        }
+        guard !isOn, !isBusy else { return }
+        if link == nil { applySpeakers() }
+        guard let link, let app = selectedApp else { return }
         isOn = true
-        isBusy = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let session = StreamSession(link: link)
-            do {
-                try session.start(app: app)
-                DispatchQueue.main.async {
-                    self.session = session
-                    self.isBusy = false
-                }
-            } catch {
-                session.stop()
-                DispatchQueue.main.async {
-                    self.isOn = false
-                    self.isBusy = false
-                    self.errorText = error.localizedDescription
-                }
+        link.setMembers(Array(selectedSpeakers.dropFirst()))
+        let generation = nextStart()
+        work.async {
+            let result = Self.startSession(link: link, app: app)
+            DispatchQueue.main.async {
+                self.adopt(result, link: link, generation: generation)
             }
         }
     }
@@ -431,7 +588,9 @@ final class PipeModel: ObservableObject {
         let session = session
         self.session = nil
         isOn = false
-        DispatchQueue.global(qos: .userInitiated).async {
+        startGeneration += 1
+        link?.setMembers([])
+        work.async {
             session?.stop()
         }
     }
@@ -441,7 +600,9 @@ final class PipeModel: ObservableObject {
         let link = link
         self.session = nil
         self.link = nil
-        DispatchQueue.global(qos: .userInitiated).async {
+        isOn = false
+        startGeneration += 1
+        work.async {
             session?.stop()
             link?.close()
             DispatchQueue.main.async(execute: completion)

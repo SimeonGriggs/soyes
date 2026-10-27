@@ -51,6 +51,9 @@ private enum Chime {
 
 final class SpeakerLink: @unchecked Sendable {
     let selected: FoundSpeaker
+    private var groupMembers: [FoundSpeaker]
+    /// Speakers this link pulled into its group, with what each was doing before.
+    private var joined: [(speaker: SonosSpeaker, before: Playback)] = []
     private let player: SonosSpeaker
     private var speaker: SonosSpeaker?
     private var streamer: Streamer?
@@ -80,10 +83,11 @@ final class SpeakerLink: @unchecked Sendable {
     var onInfo: ((NowPlaying?) -> Void)?
     var onError: ((String) -> Void)?
 
-    init(speaker: FoundSpeaker, format: StreamFormat) {
+    init(speaker: FoundSpeaker, format: StreamFormat, group: [FoundSpeaker] = []) {
         selected = speaker
         player = SonosSpeaker(host: speaker.host)
         self.format = format
+        groupMembers = group.filter { $0.host != speaker.host }
     }
 
     func setFormat(_ format: StreamFormat) {
@@ -156,6 +160,7 @@ final class SpeakerLink: @unchecked Sendable {
                 if unmute { try? restore.setMute(original) }
             }
         }
+        releaseGroup()
         streamer?.stop()
     }
 
@@ -381,6 +386,68 @@ final class SpeakerLink: @unchecked Sendable {
             if unmute { try? speaker.setMute(false) }
         } catch {
             onState?(.unreachable)
+            return
+        }
+        syncGroup()
+    }
+
+    /// Changes which other speakers play along. Takes effect at once while the
+    /// stream holds the speaker, otherwise on the next hold.
+    func setMembers(_ members: [FoundSpeaker]) {
+        lock.lock()
+        groupMembers = members.filter { $0.host != selected.host }
+        lock.unlock()
+        commands.async { [weak self] in
+            self?.syncGroup()
+        }
+    }
+
+    /// Runs on the command queue. Gives back joined speakers that are no longer
+    /// wanted and joins wanted ones that are not in the group yet. A speaker that
+    /// already follows the coordinator is left alone and never given back.
+    private func syncGroup() {
+        lock.lock()
+        let wanted = Set(groupMembers.map(\.host))
+        let leaving = joined.filter { !wanted.contains($0.speaker.host) }
+        joined.removeAll { !wanted.contains($0.speaker.host) }
+        let present = Set(joined.map(\.speaker.host))
+        let joining = groupMembers.filter { !present.contains($0.host) }
+        let coordinator = held && !closed ? speaker : nil
+        lock.unlock()
+        for member in leaving {
+            giveBack(member)
+        }
+        guard let coordinator, !joining.isEmpty, let uuid = coordinator.uuid() else { return }
+        for member in joining {
+            let joiner = SonosSpeaker(host: member.host)
+            // Without a snapshot the speaker could not be given back, so leave it alone.
+            guard let before = try? joiner.prepare(), before.uri != "x-rincon:\(uuid)" else { continue }
+            guard (try? joiner.join(to: uuid)) != nil else { continue }
+            lock.lock()
+            let keep = !closed && held && groupMembers.contains { $0.host == joiner.host }
+            if keep { joined.append((joiner, before)) }
+            lock.unlock()
+            if !keep { giveBack((joiner, before)) }
+        }
+    }
+
+    /// Returns a joined speaker to what it was doing before: its own source, or
+    /// the group it followed. With nothing to return to, it just leaves the group.
+    private func giveBack(_ member: (speaker: SonosSpeaker, before: Playback)) {
+        if !member.before.uri.isEmpty {
+            member.speaker.restore(member.before)
+        } else {
+            try? member.speaker.leaveGroup()
+        }
+    }
+
+    private func releaseGroup() {
+        lock.lock()
+        let members = joined
+        joined = []
+        lock.unlock()
+        for member in members {
+            giveBack(member)
         }
     }
 
@@ -463,6 +530,9 @@ final class SpeakerLink: @unchecked Sendable {
                 muted = false
                 unmuteAt = nil
                 lock.unlock()
+                commands.async { [weak self] in
+                    self?.releaseGroup()
+                }
                 onState?(.inUse)
                 continue
             }
