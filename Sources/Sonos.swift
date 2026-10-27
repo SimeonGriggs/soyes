@@ -3,6 +3,36 @@ import Foundation
 struct SonosSpeaker {
     var host: String
 
+    func uuid() -> String? {
+        guard let description = try? get("http://\(host):1400/xml/device_description.xml") else { return nil }
+        let udn = (tag(description, "UDN") ?? "").replacingOccurrences(of: "uuid:", with: "")
+        return udn.isEmpty ? nil : udn
+    }
+
+    func join(to coordinatorUUID: String) throws {
+        _ = try soap(
+            path: "/MediaRenderer/AVTransport/Control",
+            service: "AVTransport",
+            action: "SetAVTransportURI",
+            body: "<InstanceID>0</InstanceID><CurrentURI>x-rincon:\(coordinatorUUID)</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+        )
+        _ = try soap(
+            path: "/MediaRenderer/AVTransport/Control",
+            service: "AVTransport",
+            action: "Play",
+            body: "<InstanceID>0</InstanceID><Speed>1</Speed>"
+        )
+    }
+
+    func leaveGroup() throws {
+        _ = try soap(
+            path: "/MediaRenderer/AVTransport/Control",
+            service: "AVTransport",
+            action: "BecomeCoordinatorOfStandaloneGroup",
+            body: "<InstanceID>0</InstanceID>"
+        )
+    }
+
     func prepare() throws -> Playback {
         let media = try soap(path: "/MediaRenderer/AVTransport/Control", service: "AVTransport", action: "GetMediaInfo", body: "<InstanceID>0</InstanceID>")
         return Playback(
