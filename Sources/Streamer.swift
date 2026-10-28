@@ -53,6 +53,9 @@ final class Streamer {
     private let lock = NSLock()
     private var running = true
     private var fedUntil = Date()
+    private var padding = false
+    private var fadeInLeft = 0
+    private var lastFrame: (Int16, Int16) = (0, 0)
     private var resampler: Resampler
     private let aac: AACEncoder?
     private var aacLive = false
@@ -88,9 +91,17 @@ final class Streamer {
         guard !samples.isEmpty else { return }
         lock.lock()
         fedUntil = Date()
-        let output = resampler.process(samples)
-        lock.unlock()
+        var output = resampler.process(samples)
+        if padding {
+            fadeInLeft = edgeFrames
+            padding = false
+        }
+        fadeIn(&output)
+        if output.count >= 2 {
+            lastFrame = (output[output.count - 2], output[output.count - 1])
+        }
         pcm.append(output)
+        lock.unlock()
     }
 
     func setSourceRate(_ rate: Double) {
@@ -201,13 +212,45 @@ final class Streamer {
                 lock.unlock()
                 return
             }
+            // A late capture buffer is not silence: wait longer before padding
+            // mid-music, then keep the stream fed in small steps once padding.
             let gap = now.timeIntervalSince(fedUntil)
-            if gap > 0.05 { fedUntil = now }
-            lock.unlock()
-            if gap > 0.05 {
-                pcm.append([Int16](repeating: 0, count: Int(gap * sampleRate) * 2))
+            if gap > (padding ? 0.05 : 0.2) {
+                fedUntil = now
+                var silence = [Int16](repeating: 0, count: Int(gap * sampleRate) * 2)
+                if !padding {
+                    fadeOut(&silence)
+                    padding = true
+                }
+                pcm.append(silence)
             }
+            lock.unlock()
         }
+    }
+
+    /// About 5 ms, short enough to be inaudible but long enough to avoid a click.
+    private var edgeFrames: Int { Int(sampleRate * 0.005) }
+
+    /// Ramps from the last sent frame down to zero instead of cutting to silence.
+    private func fadeOut(_ silence: inout [Int16]) {
+        let frames = min(edgeFrames, silence.count / 2)
+        for frame in 0..<frames {
+            let level = 1 - Double(frame + 1) / Double(frames)
+            silence[frame * 2] = Int16(Double(lastFrame.0) * level)
+            silence[frame * 2 + 1] = Int16(Double(lastFrame.1) * level)
+        }
+    }
+
+    /// Continues across buffers, since one capture buffer can be shorter than the fade.
+    private func fadeIn(_ samples: inout [Int16]) {
+        let frames = min(fadeInLeft, samples.count / 2)
+        let done = edgeFrames - fadeInLeft
+        for frame in 0..<frames {
+            let level = Double(done + frame) / Double(edgeFrames)
+            samples[frame * 2] = Int16(Double(samples[frame * 2]) * level)
+            samples[frame * 2 + 1] = Int16(Double(samples[frame * 2 + 1]) * level)
+        }
+        fadeInLeft -= frames
     }
 
     private func requestPath(_ request: Data) -> String {
