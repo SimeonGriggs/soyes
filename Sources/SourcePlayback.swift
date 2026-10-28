@@ -23,14 +23,14 @@ enum SourcePlayback {
     static func nowPlaying(_ app: AudioApp) -> NowPlaying? {
         let track = queue.sync { scriptedTrack(app) }
         guard let track else { return nil }
-        let artwork = queue.sync { artwork(for: app, title: track.0, artist: track.1, album: track.2) }
+        let cover = queue.sync { artwork(for: app, title: track.0, artist: track.1, album: track.2) }
         return NowPlaying(
             appName: app.name,
             computerName: NowPlaying.thisComputer,
             title: track.0,
             artist: track.1,
             album: track.2,
-            artwork: artwork
+            artwork: cover
         )
     }
 
